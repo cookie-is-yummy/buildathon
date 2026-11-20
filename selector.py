@@ -67,6 +67,10 @@ class Maps:
         self._attrs = {}
         self.all_bits = (1 << len(map_ids)) - 1
 
+    def fact(self, name):
+        """A yes/no property of the pinned tree, checked when the maps were built."""
+        return bool(self._tables.get("facts", {}).get(name))
+
     def _get(self, table, key):
         return int(self._tables[table].get(key, "0"), 16)
 
@@ -461,10 +465,14 @@ class Diff:
         # class attributes whose assigned value changed:
         # (class qualname, attribute, class node, (first, last) lines of the assignment)
         self.attributes = []
+        self.docstrings = 0  # class or module docstrings whose text changed
+        self.changed_top = []  # new-side module/class level statements that may differ
         self.reasons = []
 
 
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_NESTING = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.If, ast.For, ast.AsyncFor, ast.While,
+            ast.With, ast.AsyncWith, ast.Try, ast.Match) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
 _COMPOUND = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match) + (
     (ast.TryStar,) if hasattr(ast, "TryStar") else ()
 )
@@ -518,6 +526,34 @@ def _def_header(node):
                  node.returns and _dump(node.returns), [_dump(p) for p in getattr(node, "type_params", [])]))
 
 
+def _only_constant_defaults_differ(a, b):
+    """True when two function headers differ only in default values that are plain
+    constants on both sides (evaluating them at import cannot fail or have effects)."""
+    if (a.name != b.name or type(a) is not type(b)
+            or [_dump(d) for d in a.decorator_list] != [_dump(d) for d in b.decorator_list]
+            or (a.returns and _dump(a.returns)) != (b.returns and _dump(b.returns))
+            or getattr(a, "type_params", []) or getattr(b, "type_params", [])):
+        return False
+    x, y = a.args, b.args
+    for field in ("posonlyargs", "args", "kwonlyargs"):
+        if [_dump(n) for n in getattr(x, field)] != [_dump(n) for n in getattr(y, field)]:
+            return False
+    if (x.vararg and _dump(x.vararg)) != (y.vararg and _dump(y.vararg)):
+        return False
+    if (x.kwarg and _dump(x.kwarg)) != (y.kwarg and _dump(y.kwarg)):
+        return False
+    old_defaults, new_defaults = x.defaults + x.kw_defaults, y.defaults + y.kw_defaults
+    if len(x.defaults) != len(y.defaults) or len(x.kw_defaults) != len(y.kw_defaults):
+        return False
+    for p, q in zip(old_defaults, new_defaults):
+        if (p is None) != (q is None):
+            return False
+        if p is not None and _dump(p) != _dump(q):
+            if not (isinstance(p, ast.Constant) and isinstance(q, ast.Constant)):
+                return False
+    return True
+
+
 def _diff_bodies(old_body, new_body, function, diff, old_blocks, new_blocks, pairs, owner=None):
     if len(old_body) != len(new_body) or any(type(a) is not type(b) for a, b in zip(old_body, new_body)):
         if function is None:
@@ -530,15 +566,23 @@ def _diff_bodies(old_body, new_body, function, diff, old_blocks, new_blocks, pai
     for a, b in zip(old_body, new_body):
         if not _touches(a, old_blocks) and not _touches(b, new_blocks):
             continue
-        if _dump(a) == _dump(b):
+        # Definitions and compound statements are compared piece by piece below; dumping a
+        # whole class to compare it would cost more than everything else put together.
+        if not isinstance(a, _NESTING) and _dump(a) == _dump(b):
             continue
+        if function is None:
+            diff.changed_top.append(b)
         _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner)
 
 
 def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=None):
     if isinstance(a, _DEFS) or isinstance(a, ast.ClassDef):
         if _def_header(a) != _def_header(b):
-            if function is None:
+            if function is None and isinstance(a, _DEFS) and _only_constant_defaults_differ(a, b):
+                # A default value is only looked at when the function is called.
+                diff.functions.append(_function_body_range(a))
+                diff.reasons.append("default argument of %s changed" % a.name)
+            elif function is None:
                 # The def or class statement runs when its module (or class body) does:
                 # whoever executes the header line depends on it.
                 diff.statements.append((_def_first_line(a), _header_last_line(a)))
@@ -587,6 +631,13 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
     # A simple statement. Inside a function, only tests that execute it can notice. At
     # module or class level the same holds: it runs when the module is imported, and the
     # recordings include import time, so its lines list every test that imports the module.
+    if _is_string_statement(a) and _is_string_statement(b):
+        # A bare string is either a docstring or does nothing at all. Inside a function it
+        # is never executed. At class or module level it only sets __doc__.
+        if function is None and a.value.value.strip() and b.value.value.strip():
+            diff.docstrings += 1
+            diff.reasons.append("docstring at line %d" % a.lineno)
+            return
     if function is None:
         found = []
         if _only_lambda_bodies_differ(a, b, found) and found:
@@ -602,6 +653,11 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
             return
         diff.reasons.append("module or class level statement at line %d" % a.lineno)
     diff.statements.append((a.lineno, a.end_lineno))
+
+
+def _is_string_statement(statement):
+    return (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str))
 
 
 def _assigned_name(statement):
@@ -641,13 +697,25 @@ def diff_python(old_text, new_text, old_blocks, new_blocks):
     old_tree = ast.parse(old_text)
     try:
         new_tree = ast.parse(new_text)
-        # compile() also rejects what the parser accepts, such as `return` outside a function
-        compile(new_tree, "<patched>", "exec", dont_inherit=True)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
     diff = Diff()
     pairs = []
     _diff_bodies(old_tree.body, new_tree.body, None, diff, old_blocks, new_blocks, pairs)
+    # The compiler also rejects things the parser accepts (`return` outside a function, a
+    # name both global and assigned before, ...). Those errors are local to a function or to
+    # one module/class level statement, so only the statements that changed are compiled;
+    # compiling a whole large module costs ten times more than the rest of the analysis.
+    try:
+        if diff.whole_module or any(
+            isinstance(n, ast.ImportFrom) and n.module == "__future__" for n in diff.changed_top
+        ):
+            compile(new_tree, "<patched>", "exec", dont_inherit=True)
+        else:
+            smallest = [n for n in diff.changed_top if not isinstance(n, ast.ClassDef)]
+            compile(ast.Module(body=smallest, type_ignores=[]), "<patched>", "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
     if diff.statements:
         # A statement edit that changes which names are local, or turns the function into a
         # generator, affects every path through the function, not only the edited statement.
@@ -690,6 +758,8 @@ def select_python(change, maps, notes):
         return bits | maps.importers(path)
     if diff.whole_module:
         notes.append("%s whole-module change (%s)" % (path, "; ".join(diff.reasons[:2])))
+        return bits | maps.importers(path)
+    if diff.docstrings and not maps.fact("docstrings_unused"):
         return bits | maps.importers(path)
     for first, last in diff.functions:
         bits |= maps.started(path, first, last)

@@ -11,8 +11,13 @@ Output: maps/tests.json   test ids, in recording order (index = bit position in 
 
 Nothing here knows about any patch. The maps describe the pinned commit only.
 
-usage: build_maps.py <pinned sqlglot checkout> <tests.json> <entry repo> <recording dir>
+A whole-suite recording (tools/site_seq, one process, one coverage context per test) can be
+merged in: run alone, a test fills every cache itself; in a whole-suite run it may take a
+cache-hit path instead. The maps hold the union.
+
+usage: build_maps.py <pinned checkout> <tests.json> <entry repo> <recording dir> [<whole-suite .json>...]
 """
+import ast
 import glob
 import json
 import os
@@ -51,6 +56,25 @@ for number, test_id in enumerate(ids):
             for key in rec.get(kind, []):
                 table[key] = table.get(key, 0) | bit
 
+for suite_file in sys.argv[5:]:
+    rec = json.load(open(suite_file))
+    if rec["exit"] != 0:
+        # In reversed order a few tests fail at the pinned commit (they depend on state left
+        # by earlier tests). Their executed lines are still lines those tests can execute,
+        # so the recording is still merged: it can only widen a selection.
+        print(f"{suite_file}: note, this whole-suite run had failures (exit {rec['exit']})")
+    added = 0
+    for source, target in ((rec["lines"], lines), (rec["calls"], calls)):
+        for f, table in source.items():
+            mine = target.setdefault(f, {})
+            for ln, bits in table.items():
+                ln, bits = int(ln), int(bits, 16)
+                before = mine.get(ln, 0)
+                if bits & ~before:
+                    added += 1
+                mine[ln] = before | bits
+    print(f"{suite_file}: widened {added} line or call entries")
+
 tracked = [f for f in subprocess.run(["git", "-C", REPO, "ls-files"], capture_output=True, text=True).stdout.split("\n") if f]
 
 if os.path.isdir(OUT):
@@ -65,8 +89,33 @@ def enc(bits):
 # Modules that every test tries and fails to import for reasons unrelated to the repository
 # (Windows-only modules and the like) are kept too: the selector only asks about names that
 # a new file in the repository could provide.
+# Fact: does any code that the tests execute consume a docstring? The selector treats a
+# changed class or module docstring as harmless only if nothing does. The one consumer at
+# the pinned commit copies a class's docstring back onto itself (replacing None with ""),
+# which a non-empty docstring passes through unchanged.
+BENIGN_DOC_USES = {'setattr(cls, "__doc__", getattr(cls, "__doc__", None) or "")'}
+doc_sites = []
+for f in tracked:
+    if not f.endswith(".py"):
+        continue
+    source = open(os.path.join(REPO, f), encoding="utf-8").read()
+    if "__doc__" not in source and "getdoc" not in source and "doctest" not in source:
+        continue
+    text_lines = source.split("\n")
+    for node in ast.walk(ast.parse(source)):
+        hit = (
+            (isinstance(node, ast.Attribute) and node.attr in ("__doc__", "getdoc"))
+            or (isinstance(node, ast.Name) and node.id in ("__doc__", "getdoc", "doctest"))
+            or (isinstance(node, ast.Constant) and node.value == "__doc__")
+            or (isinstance(node, (ast.Import, ast.ImportFrom)) and "doctest" in ast.dump(node))
+        )
+        if hit and lines.get(f, {}).get(node.lineno):  # only code some test executes
+            doc_sites.append((f, node.lineno, text_lines[node.lineno - 1].strip()))
+docstrings_unused = all(text in BENIGN_DOC_USES for _, _, text in doc_sites)
+print("docstring consumers executed by tests:", sorted(set(doc_sites)), "-> docstrings_unused =", docstrings_unused)
+
 json.dump(ids, open(os.path.join(OUT, "tests.json"), "w"), indent=0)
-files = {"tracked": tracked}
+files = {"tracked": tracked, "facts": {"docstrings_unused": docstrings_unused}}
 for kind in KINDS:
     files[kind] = {k: enc(b) for k, b in sorted(tables[kind].items())}
 json.dump(files, open(os.path.join(OUT, "files.json"), "w"), separators=(",", ":"))
