@@ -120,6 +120,28 @@ for kind in KINDS:
     files[kind] = {k: enc(b) for k, b in sorted(tables[kind].items())}
 json.dump(files, open(os.path.join(OUT, "files.json"), "w"), separators=(",", ":"))
 
+# Line ranges of top-level statements (and, for top-level classes, of the statements in the
+# class body), so the selector can parse just the statement a patch touches.
+index = {}
+for f in tracked:
+    if not f.endswith(".py"):
+        continue
+    try:
+        tree = ast.parse(open(os.path.join(REPO, f), encoding="utf-8").read())
+    except SyntaxError:
+        continue
+
+    def span(node):
+        first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        return [first, node.end_lineno]
+
+    entries = []
+    for node in tree.body:
+        children = [span(child) for child in node.body] if isinstance(node, ast.ClassDef) else None
+        entries.append(span(node) + [node.name if children is not None else None, children])
+    index[f] = entries
+json.dump(index, open(os.path.join(OUT, "index.json"), "w"), separators=(",", ":"))
+
 total = 0
 for f in sorted(set(lines) | set(calls)):
     if not f.endswith(".py"):

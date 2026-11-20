@@ -65,7 +65,15 @@ class Maps:
         self._tables = files
         self._lines = {}
         self._attrs = {}
+        self._index = None
         self.all_bits = (1 << len(map_ids)) - 1
+
+    def index(self, path):
+        """Line ranges of the pinned file's top-level statements and class-body statements."""
+        if self._index is None:
+            name = os.path.join(MAPS, "index.json")
+            self._index = json.load(open(name)) if os.path.exists(name) else {}
+        return self._index.get(path)
 
     def fact(self, name):
         """A yes/no property of the pinned tree, checked when the maps were built."""
@@ -691,17 +699,110 @@ def _names_read_at_class_time(statement):
     return names
 
 
-def diff_python(old_text, new_text, old_blocks, new_blocks):
-    """Compare the pinned and patched source. Returns a Diff, or None when the patched file
-    is not valid Python."""
-    old_tree = ast.parse(old_text)
-    try:
-        new_tree = ast.parse(new_text)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
+def _find_chunk(index, old_blocks):
+    """Find the one top-level statement, or the one statement of a top-level class body,
+    that strictly contains every changed block. Returns (first, last, class name or None)
+    or None when the change is not confined that way."""
+    if not index or not old_blocks:
         return None
+
+    def inside(first, last):
+        for block_first, block_last in old_blocks:
+            if block_first <= block_last:
+                if not (first <= block_first and block_last <= last):
+                    return False
+            elif not (first < block_first <= last):  # an insertion must be strictly inside
+                return False
+        return True
+
+    for first, last, name, children in index:
+        if first > old_blocks[0][0]:
+            break
+        if not inside(first, last):
+            continue
+        if children:
+            for child_first, child_last in children:
+                if inside(child_first, child_last):
+                    return child_first, child_last, name
+        return first, last, None
+    return None
+
+
+def _first_indent(lines, first, last):
+    """Leading whitespace of the first line of code in lines first..last."""
+    for line in lines[first - 1:last]:
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("#"):
+            return line[:len(line) - len(stripped)]
+    return None
+
+
+def _parse_chunk(lines, first, last, wrapped):
+    """Parse lines first..last of a file on their own. A class-body statement is indented,
+    so it is parsed inside a one-line `if` wrapper. Returns the statements, with line
+    numbers as in the whole file, or None if the lines do not form whole statements."""
+    text = "\n".join(lines[first - 1:last]) + "\n"
+    if wrapped:
+        tree = ast.parse("if 1:\n" + text)
+        if len(tree.body) != 1 or not isinstance(tree.body[0], ast.If) or tree.body[0].orelse:
+            return None
+        statements = tree.body[0].body
+        offset = first - 2
+    else:
+        tree = ast.parse(text)
+        statements = tree.body
+        offset = first - 1
+    if offset:
+        for statement in statements:
+            ast.increment_lineno(statement, offset)
+    return statements
+
+
+def diff_python(old_text, new_text, old_blocks, new_blocks, index=None):
+    """Compare the pinned and patched source. Returns a Diff, or None when the patched file
+    is not valid Python.
+
+    Parsing a 10,000-line module twice costs far more than the rest of the analysis, so
+    when every changed line sits strictly inside one top-level statement (or one statement
+    of a top-level class), only that statement is parsed, from the old and the new text.
+    This is safe: the text before and after it is unchanged, so if the new statement parses
+    on its own into exactly one statement, the rest of the file parses as before. If it
+    does not, we fall back to parsing the whole file.
+    """
     diff = Diff()
     pairs = []
-    _diff_bodies(old_tree.body, new_tree.body, None, diff, old_blocks, new_blocks, pairs)
+    new_tree = None
+    chunk = _find_chunk(index, old_blocks)
+    old_statements = new_statements = None
+    owner = None
+    if chunk is not None:
+        first, last, class_name = chunk
+        growth = sum((n[1] - n[0]) - (o[1] - o[0]) for o, n in zip(old_blocks, new_blocks))
+        try:
+            old_statements = _parse_chunk(old_text.split("\n"), first, last, class_name is not None)
+        except (SyntaxError, ValueError):
+            old_statements = None
+        if old_statements is not None and len(old_statements) == 1:
+            try:
+                new_lines = new_text.split("\n")
+                new_statements = _parse_chunk(new_lines, first, last + growth, class_name is not None)
+                # The wrapper would accept a statement indented differently from its
+                # siblings; the real file would not. Then let the whole-file parse decide.
+                if _first_indent(new_lines, first, last + growth) != _first_indent(old_text.split("\n"), first, last):
+                    new_statements = None
+            except (SyntaxError, ValueError, RecursionError, MemoryError):
+                new_statements = None
+            if class_name is not None:
+                owner = (class_name, None)
+    if old_statements is None or new_statements is None or len(old_statements) != 1 or len(new_statements) != 1:
+        old_statements = ast.parse(old_text).body
+        try:
+            new_tree = ast.parse(new_text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return None
+        new_statements = new_tree.body
+        owner = None
+    _diff_bodies(old_statements, new_statements, None, diff, old_blocks, new_blocks, pairs, owner)
     # The compiler also rejects things the parser accepts (`return` outside a function, a
     # name both global and assigned before, ...). Those errors are local to a function or to
     # one module/class level statement, so only the statements that changed are compiled;
@@ -710,7 +811,7 @@ def diff_python(old_text, new_text, old_blocks, new_blocks):
         if diff.whole_module or any(
             isinstance(n, ast.ImportFrom) and n.module == "__future__" for n in diff.changed_top
         ):
-            compile(new_tree, "<patched>", "exec", dont_inherit=True)
+            compile(new_tree if new_tree is not None else ast.parse(new_text), "<patched>", "exec", dont_inherit=True)
         else:
             smallest = [n for n in diff.changed_top if not isinstance(n, ast.ClassDef)]
             compile(ast.Module(body=smallest, type_ignores=[]), "<patched>", "exec", dont_inherit=True)
@@ -752,7 +853,7 @@ def select_python(change, maps, notes):
         raise RunEverything("encoding declaration")
     # Tests during which repository code read this file as data see any change to its text.
     bits = maps.readers(path)
-    diff = diff_python(old_text, new_text, old_blocks, new_blocks)
+    diff = diff_python(old_text, new_text, old_blocks, new_blocks, maps.index(path))
     if diff is None:
         notes.append("%s no longer compiles: every test importing it" % path)
         return bits | maps.importers(path)
