@@ -797,7 +797,7 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
             found = []
             if _operator_swaps(a, b, found, True) and found:
                 diff.swaps.append((False, a.lineno, _header_last_line(a), found))
-                diff.reasons.append("%s operator at line %d" % (_SWAP_NAMES[found[0][0]], found[0][1]))
+                diff.reasons.append("%s at line %d" % (_SWAP_NAMES[found[0][0]], found[0][1]))
             else:
                 diff.statements.append((a.lineno, _header_last_line(a)))
         for field in _BODY_FIELDS:
@@ -839,7 +839,7 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
             swapped = []
             if len(found) == 1 and _operator_swaps(a, b, swapped) and swapped:
                 diff.swaps.append((True, found[0], found[0], swapped))
-                diff.reasons.append("%s operator in the lambda at line %d" % (_SWAP_NAMES[swapped[0][0]], found[0]))
+                diff.reasons.append("%s in the lambda at line %d" % (_SWAP_NAMES[swapped[0][0]], found[0]))
                 return
             diff.lambdas.extend(found)
             diff.reasons.append("body of a module or class level lambda at line %d" % found[0])
@@ -864,7 +864,7 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
         # expression was evaluated and whether the new operator would ever have given a
         # different result.
         diff.swaps.append((False, a.lineno, a.end_lineno, found))
-        diff.reasons.append("%s operator at line %d" % (_SWAP_NAMES[found[0][0]], found[0][1]))
+        diff.reasons.append("%s at line %d" % (_SWAP_NAMES[found[0][0]], found[0][1]))
         return
     if function is None:
         diff.reasons.append("module or class level statement at line %d" % a.lineno)
@@ -883,7 +883,7 @@ def _literal(node):
                              ast.DictComp, ast.SetComp, ast.GeneratorExp, ast.Lambda))
 
 
-_SWAP_NAMES = {"cmp": "comparison", "bool": "and/or"}
+_SWAP_NAMES = {"cmp": "comparison operator", "bool": "and/or operator", "operand": "later operand of and/or"}
 # (node type, field): the value of that expression is only ever tested for truth
 _TRUTH_ONLY = {(ast.If, "test"), (ast.While, "test"), (ast.IfExp, "test"), (ast.Assert, "test"),
                (ast.comprehension, "ifs")}
@@ -902,12 +902,20 @@ def _bool_tree(node, leaves):
     return isinstance(node.op, ast.And), tuple(children)
 
 
+def _plain_expression(node):
+    """False for an expression that changes its whole function just by being there: one
+    that binds a name (`:=`) or makes the function a generator or coroutine."""
+    return not any(isinstance(x, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await)) for x in ast.walk(node))
+
+
 def _operator_swaps(a, b, found, header=False, truth=False):
     """True when a and b are the same code except that some two-operand comparisons use a
-    different operator, or some and/or expressions combine the same operands differently.
+    different operator, some and/or expressions combine the same operands differently, or
+    something changed inside an operand of an and/or expression that is not its first.
     Those are appended to `found` as ("cmp", line, column, old, new), with operators
-    numbered as in _COMPARISONS, or ("bool", line, column, old tree, new tree, truth,
-    operands), where `truth` says the expression's value is only tested for truth. With
+    numbered as in _COMPARISONS, ("bool", line, column, old tree, new tree, truth,
+    operands), where `truth` says the expression's value is only tested for truth, or
+    ("operand", line, column, position of the operand, number of operands). With
     `header`, the nested statement lists of a compound statement are not compared (the
     caller does that)."""
     if type(a) is not type(b):
@@ -930,9 +938,18 @@ def _operator_swaps(a, b, found, header=False, truth=False):
                 return False
             found.append(("bool", a.lineno, a.col_offset, old_tree, new_tree, truth, old_leaves))
             return True
-        below = truth
-    else:
-        below = isinstance(a, ast.UnaryOp) and isinstance(a.op, ast.Not)
+        for position, (x, y) in enumerate(zip(old_leaves, new_leaves)):
+            inside = []
+            if _operator_swaps(x, y, inside, False, truth):
+                found.extend(inside)
+            elif position and _plain_expression(x) and _plain_expression(y):
+                # Anything may have changed inside this operand, but nothing outside it:
+                # only a test that gets as far as evaluating the operand can notice.
+                found.append(("operand", a.lineno, a.col_offset, position, len(old_leaves)))
+            else:
+                return False
+        return True
+    below = isinstance(a, ast.UnaryOp) and isinstance(a.op, ast.Not)
     for name in a._fields:
         x, y = getattr(a, name, None), getattr(b, name, None)
         if header and name in _BODY_FIELDS and isinstance(x, list):
@@ -1336,6 +1353,19 @@ def select_python(change, maps, notes):
                     evaluated |= tests
                     # same answer only if both are known and both True or both False
                     if known & both != both or (true & both) not in (0, both):
+                        differs |= tests
+            elif site[0] == "operand":
+                # Unaffected: a test that was seen evaluating the and/or expression and
+                # never got as far as the changed operand.
+                line, column, position, count = site[1:]
+                known = maps.outcomes(path, line, column, count)
+                if known is None:
+                    bits |= executing
+                    break
+                evaluated = differs = 0
+                for operands, true, tests in known:
+                    evaluated |= tests
+                    if operands < 0 or operands >> position & 1:
                         differs |= tests
             else:
                 line, column, old_tree, new_tree, truth, leaves = site[1:]

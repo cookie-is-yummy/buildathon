@@ -1,15 +1,17 @@
 """Operator patches for checking the comparison and and/or rules (EVALUATION ONLY).
 
 For every two-operand comparison in the pinned sqlglot and every other comparison operator
-(kind "cmp"), or for every single `and`/`or` keyword flipped to the other one (kind
-"bool"), the selector is asked twice: with the recordings and without. Where the recordings
-let it drop tests, the patch is a candidate; a sample of candidates is written out together
-with the tests that were dropped. tools/swap_gt.py then runs exactly those tests on the
-patched code: every one of them must pass.
+(kind "cmp"), for every single `and`/`or` keyword flipped to the other one (kind "bool"),
+or for every operand of an and/or expression except its first, replaced by an expression
+that raises as soon as it is evaluated (kind "operand"), the selector is asked twice: with
+the recordings and without. Where the recordings let it drop tests, the patch is a
+candidate; a sample of candidates is written out together with the tests that were
+dropped. tools/swap_gt.py then runs exactly those tests on the patched code: every one of
+them must pass.
 
 Also prints what the rule saves over ALL such patches (the commit cost with and without).
 
-usage: gen_swaps.py <pinned checkout> <tests.json> <output dir> <how many> <cmp|bool> [seed]
+usage: gen_swaps.py <pinned checkout> <tests.json> <output dir> <how many> <cmp|bool|operand> [seed]
 """
 import ast
 import difflib
@@ -36,6 +38,7 @@ blind.outcomes = lambda *a: None
 TOKENS = ["is", "is not", "==", "!=", "<", "<=", ">", ">="]
 PATTERN = re.compile(r"is\s+not|is|==|!=|<=|>=|<|>")
 WORD = re.compile(r"\b(and|or)\b")
+RAISES = '(_ for _ in ()).throw(BaseException("operand evaluated"))'
 
 
 def cost(numbers):
@@ -64,6 +67,11 @@ def variants(text, lines):
                 if new != old:
                     yield (right.lineno, "%s -> %s" % (TOKENS[old], TOKENS[new]),
                            text[:start + match.start()] + TOKENS[new] + text[start + match.end():])
+        if MODE == "operand" and isinstance(node, ast.BoolOp):
+            for position, value in enumerate(node.values):
+                if position and not isinstance(value, ast.BoolOp):
+                    start, end = offset(lines, value.lineno, value.col_offset), offset(lines, value.end_lineno, value.end_col_offset)
+                    yield (value.lineno, "operand %d" % min(position, 3), text[:start] + RAISES + text[end:])
         if MODE == "bool" and isinstance(node, ast.BoolOp):
             word = "and" if isinstance(node.op, ast.And) else "or"
             other = "or" if word == "and" else "and"
@@ -126,7 +134,7 @@ for sub in ("commits", "files"):
     os.makedirs(os.path.join(OUT, sub), exist_ok=True)
 meta = {}
 for number, (path, line, label, patch, new_text, dropped, before) in enumerate(chosen):
-    cid = "%s%04d" % ("w" if MODE == "cmp" else "b", number)
+    cid = "%s%04d" % (MODE[0] if MODE != "cmp" else "w", number)
     open(os.path.join(OUT, "commits", cid + ".patch"), "w", encoding="utf-8").write(patch)
     open(os.path.join(OUT, "files", cid + ".py"), "w", encoding="utf-8").write(new_text)
     meta[cid] = {

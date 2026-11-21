@@ -4,15 +4,21 @@ Every comparison `a OP b` in the repository's Python files (OP one of
 is, is not, ==, !=, <, <=, >, >=; chained comparisons are left alone) is rewritten, when
 the file is imported, into a call that returns exactly what the comparison returns and
 also notes how the two operands relate: the answer each operator of that list gives for
-them (where it can be asked without running arbitrary code). Per test and comparison we
-keep the set of distinct outcomes. So we learn, for every comparison and every test,
-whether the test evaluated it and what the operands looked like each time.
+them, where that can be asked without disturbing the test (see _kind: no comparison
+method written in Python is ever called, except to ask `== None`, and containers are
+never compared with each other). Per test and comparison we keep the set of distinct
+outcomes. So we learn, for every comparison and every test, whether the test evaluated it
+and what the operands looked like each time.
 
 Every `and`/`or` expression is recorded too. For the whole expression (nested `and`/`or`
 flattened; its operands that are not themselves `and`/`or` are its "leaves", numbered left
 to right) we note each distinct outcome a test produced: which leaves were evaluated and
 which of those were true. An evaluation that did not finish (an exception, a generator
 that was suspended in the middle) is noted as "abandoned".
+
+Code that runs because the recorder asked something (an __eq__ asked about None, the
+truth of an operand) is recorded like any other code: a recording may hold more than the
+test does on its own, never less.
 
 Two modes:
   BR_CMP=<prefix>      one test per process tree: writes <prefix>.<pid>.json at exit
@@ -38,17 +44,47 @@ if _OUT or _SEQ:
     _OPS = (ast.Is, ast.IsNot, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
     _FUNCS = (operator.is_, operator.is_not, operator.eq, operator.ne, operator.lt, operator.le, operator.gt, operator.ge)
     _N = len(_OPS)
-    # values whose comparison methods are known to be free of side effects: for these
-    # every operator is asked; for anything else only identity and the nearest operator
-    # (the answers of the others stay unknown)
-    _PLAIN = (int, float, str, bytes, bool, type(None), tuple, frozenset)
-    _NEAR = {0: (2,), 1: (3,), 2: (0, 3), 3: (1, 2), 4: (5,), 5: (4,), 6: (7,), 7: (6,)}
+    _DUNDERS = ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")
+    _SLOT = (type(object.__eq__), type(str.lower))  # how methods written in C look
+    _NONE = type(None)
 
     _sites = []      # index -> (file, line, column, operator index)
     _context = [0]   # bumped when the current test changes (suite mode)
     _state = []      # index -> [context stamp, outcomes already noted in this context]
     _outcomes = {}   # context key -> set of (site index, outcome)
     _key = [None if _SEQ else "process"]
+    _kinds = {}      # type -> kind, see _kind
+    # True while the recorder asks an object's own __eq__ about None (so that this is not
+    # asked again from inside that very __eq__)
+    _busy = [False]
+
+    def _kind(tp):
+        """How a type compares. The recorder must not change what the test does, so it
+        only asks questions whose answer cannot run code that changes anything:
+        0  a plain value (None, numbers, strings, bytes and subclasses that keep the
+           built-in comparison methods): every operator can be asked;
+        1  no __eq__ of its own: == is the same as `is`;
+        2  another type whose comparison methods are written in C (list, dict, ...): ==
+           can be asked against kinds 0 and 1 (it does not look inside);
+        3  a comparison method written in Python: only `== None` is asked."""
+        kind = _kinds.get(tp)
+        if kind is None:
+            if any(type(getattr(tp, name, None)) not in _SLOT for name in _DUNDERS):
+                kind = 3
+            elif tp is _NONE or issubclass(tp, (int, float, str, bytes)):
+                kind = 0
+            elif tp.__eq__ is object.__eq__ and tp.__ne__ is object.__ne__:
+                kind = 1
+            else:
+                kind = 2
+            _kinds[tp] = kind
+        return kind
+
+    def _plain(value):
+        kind = _kind(type(value))
+        if kind == 2 and type(value) is tuple and len(value) <= 16:
+            return all(_kind(type(item)) == 0 for item in value)
+        return kind == 0
 
     def _compare(a, b, index):
         """Return `a OP b` and note the outcome: for each of the eight operators whether
@@ -63,18 +99,36 @@ if _OUT or _SEQ:
             raise
         known = true = 0
         if result is True or result is False:
-            plain = type(a) in _PLAIN and type(b) in _PLAIN
-            near = _NEAR[op]
-            for alt in range(_N):
-                if alt == op:
-                    other = result
-                elif alt < 2 or plain or alt in near:
+            same = a is b
+            answers = {0: same, 1: not same, op: result}
+            if _plain(a) and _plain(b):
+                for alt in range(_N):
+                    if alt not in answers:
+                        try:
+                            answers[alt] = _FUNCS[alt](a, b)
+                        except BaseException:
+                            pass
+            elif op < 2:
+                # `is` / `is not`: what would == / != say?
+                ka, kb = _kind(type(a)), _kind(type(b))
+                if ka == 1 and kb == 1:
+                    answers[2], answers[3] = same, not same
+                elif ka < 3 and kb < 3 and not (ka == 2 and kb == 2):
                     try:
-                        other = _FUNCS[alt](a, b)
+                        answers[2] = _FUNCS[2](a, b)
+                        answers[3] = _FUNCS[3](a, b)
                     except BaseException:
-                        continue
-                else:
-                    continue
+                        pass
+                elif (a is None or b is None) and not _busy[0]:
+                    _busy[0] = True
+                    try:
+                        answers[2] = _FUNCS[2](a, b)
+                        answers[3] = _FUNCS[3](a, b)
+                    except BaseException:
+                        pass
+                    finally:
+                        _busy[0] = False
+            for alt, other in answers.items():
                 if other is True:
                     known |= 1 << alt
                     true |= 1 << alt
