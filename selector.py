@@ -146,11 +146,16 @@ class Maps:
         return bits
 
     def attribute_readers(self, path, qualname, name):
-        """Tests that read class attribute `name` assigned in the body of class `qualname`
-        (through the class, a subclass or an instance), or anything computed from it.
-        None when the attribute was not instrumented."""
+        """(tests, used_by_hooks) for class attribute `name` assigned in the body of class
+        `qualname`: the tests that read it (through the class, a subclass or an instance) or
+        anything computed from it, and whether class-creation hooks read it. None when the
+        attribute was not instrumented."""
         value = self._attributes(path).get(qualname, {}).get(name)
-        return None if value is None else int(value, 16)
+        if value is None:
+            return None
+        if value.startswith("!"):
+            return int(value[1:], 16), True
+        return int(value, 16), False
 
     def _attributes(self, path):
         table = self._attrs.get(path)
@@ -655,12 +660,63 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
             diff.reasons.append("body of a module or class level lambda at line %d" % found[0])
             return
         target = _assigned_name(a)
-        if owner and target and target == _assigned_name(b):
-            diff.attributes.append((owner[0], target, owner[1], (a.lineno, a.end_lineno)))
-            diff.reasons.append("class attribute %s.%s" % (owner[0], target))
-            return
+        if owner and target and target == _assigned_name(b) and _dump(getattr(a, "annotation", None) or a.targets[0]) == _dump(getattr(b, "annotation", None) or b.targets[0]):
+            # Only a change that cannot make the class body itself fail at import is
+            # narrowed to the attribute's readers: constants replaced by constants of the
+            # same type, or entries removed from a literal.
+            if _safe_value_change(a.value, b.value, False):
+                diff.attributes.append((owner[0], target, False, (a.lineno, a.end_lineno)))
+                diff.reasons.append("class attribute %s.%s" % (owner[0], target))
+                return
+            if _safe_value_change(a.value, b.value, True):
+                diff.attributes.append((owner[0], target, True, (a.lineno, a.end_lineno)))
+                diff.reasons.append("class attribute %s.%s (entries removed)" % (owner[0], target))
+                return
         diff.reasons.append("module or class level statement at line %d" % a.lineno)
     diff.statements.append((a.lineno, a.end_lineno))
+
+
+def _subsequence(new, old):
+    position = 0
+    for item in new:
+        while position < len(old) and old[position] != item:
+            position += 1
+        if position == len(old):
+            return False
+        position += 1
+    return True
+
+
+def _safe_value_change(a, b, allow_removal):
+    """True when value expression `b` differs from `a` only by constants replaced with
+    constants of the same type inside literals (and, if allowed, by entries removed from a
+    literal). Evaluating such a value at import cannot raise where the old one did not."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.Constant):
+        return type(a.value) is type(b.value)
+    if isinstance(a, ast.UnaryOp):
+        return (type(a.op) is type(b.op) and isinstance(a.operand, ast.Constant) and isinstance(b.operand, ast.Constant)
+                and type(a.operand.value) is type(b.operand.value) and type(a.operand.value) in (int, float))
+    if isinstance(a, (ast.List, ast.Tuple, ast.Set)):
+        if len(a.elts) == len(b.elts):
+            return all(_safe_value_change(x, y, allow_removal) for x, y in zip(a.elts, b.elts))
+        return allow_removal and len(b.elts) < len(a.elts) and _subsequence(
+            [_dump(x) for x in b.elts], [_dump(x) for x in a.elts])
+    if isinstance(a, ast.Dict):
+        if len(a.keys) == len(b.keys):
+            for k1, k2, v1, v2 in zip(a.keys, b.keys, a.values, b.values):
+                if (k1 is None) != (k2 is None):
+                    return False
+                if k1 is not None and not _safe_value_change(k1, k2, allow_removal):
+                    return False
+                if not _safe_value_change(v1, v2, allow_removal):
+                    return False
+            return True
+        return allow_removal and len(b.keys) < len(a.keys) and _subsequence(
+            [(k and _dump(k), _dump(v)) for k, v in zip(b.keys, b.values)],
+            [(k and _dump(k), _dump(v)) for k, v in zip(a.keys, a.values)])
+    return _dump(a) == _dump(b)
 
 
 def _is_string_statement(statement):
@@ -868,12 +924,14 @@ def select_python(change, maps, notes):
         bits |= maps.covering(path, first, last)
     for line in diff.lambdas:
         bits |= maps.started(path, line, line)
-    for qualname, name, class_node, lines in diff.attributes:
-        readers = maps.attribute_readers(path, qualname, name)
-        if readers is None:
-            # not instrumented: fall back to everyone who runs the assignment (the importers)
-            readers = maps.covering(path, lines[0], lines[1])
-        bits |= readers
+    for qualname, name, entries_removed, lines in diff.attributes:
+        found = maps.attribute_readers(path, qualname, name)
+        if found is None or (entries_removed and found[1]):
+            # Not instrumented, or a hook that runs when classes are created reads it and
+            # might need an entry that was removed: everyone who runs the assignment.
+            bits |= maps.covering(path, lines[0], lines[1])
+        else:
+            bits |= found[0]
     notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s) %s" % (
         path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes),
         "; ".join(diff.reasons[:2])))

@@ -8,8 +8,9 @@ the output holds ONE set of tests: those that read the attribute itself, or anyt
 computed from it:
   - attributes that `__init_subclass__` or a metaclass computed while a class was being
     created, after reading it (e.g. `required_args` from `arg_types`);
-  - for classes with a sqlglot metaclass, whose own body the recorder cannot watch during
-    creation: every attribute the metaclass computed for that class;
+  - for the few attributes a sqlglot metaclass may fetch by name from the class dictionary
+    (the recorder cannot watch those during creation): every attribute the metaclass
+    computed for that class;
   - attributes assigned later in the same class body by a statement that reads its name
     (e.g. `B = {**A, ...}`).
 An attribute whose value is used during class creation in a way we cannot follow is left
@@ -29,12 +30,14 @@ OUT = os.path.join(ENTRY, "maps", "attrs")
 ids = [t["id"] for t in json.load(open(TESTS))["tests"]]
 
 reads = {}  # key -> bits
-wrapped, prewrapped = set(), set()
+wrapped, prewrapped, late = set(), set(), set()
 computed = {}  # class id -> names set during creation
 creation = {}  # class id -> {(key read, frozenset(names computed earlier))}
 for number in range(len(ids)):
     rc_file = os.path.join(REC, f"{number}.rc")
     if not os.path.exists(rc_file) or open(rc_file).read().strip() != "0":
+        if os.environ.get("ALLOW_PARTIAL"):
+            continue
         raise SystemExit(f"test {number} {ids[number]} has no passing attribute recording")
     parts = glob.glob(os.path.join(REC, f"{number}.*.json"))
     if not parts:
@@ -44,6 +47,7 @@ for number in range(len(ids)):
         rec = json.load(open(part))
         wrapped.update(rec["wrapped"])
         prewrapped.update(rec["prewrapped"])
+        late.update(rec.get("late", ()))
         for key in rec["reads"]:
             reads[key] = reads.get(key, 0) | bit
         for class_id, names in rec["computed"].items():
@@ -53,7 +57,7 @@ for number in range(len(ids)):
             for key, earlier in events:
                 table.add((key, frozenset(earlier)))
 
-sys.path.insert(0, ENTRY)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from selector import _assigned_name, _names_read_at_class_time  # the same static rules
 
 class_bodies = {}  # class id -> ClassDef
@@ -84,13 +88,16 @@ for class_id, names in computed.items():
         for key, earlier in events:
             if name not in earlier:
                 depends.setdefault(key, set()).add(target)
-    if class_id not in prewrapped and class_id in class_bodies:
-        # body attributes of this class were invisible while its metaclass ran
+    if class_id in class_bodies:
+        # Body attributes the recorder could not watch while the class was being created
+        # (the metaclass may fetch them by name from the class dictionary): assume every
+        # computed attribute of the class depends on them.
         for statement in class_bodies[class_id].body:
             own = _assigned_name(statement)
-            if own:
+            if own and (class_id not in prewrapped or class_id + "::" + own in late):
                 depends.setdefault(class_id + "::" + own, set()).update(class_id + "::" + n for n in names)
 
+hook_reads = {key for events in creation.values() for key, _ in events}
 by_file = {}
 untracked = 0
 for class_id, node in class_bodies.items():
@@ -128,7 +135,10 @@ for class_id, node in class_bodies.items():
         bits = 0
         for key in closure:
             bits |= reads.get(key, 0)
-        by_file.setdefault(path, {}).setdefault(qual, {})[name] = "%x" % bits
+        # "!" marks an attribute that class-creation hooks read (or may read: the body of a
+        # class with a sqlglot metaclass is invisible to the recorder while it is created)
+        hooked = class_id not in prewrapped or any(key in hook_reads or key in late for key in closure)
+        by_file.setdefault(path, {}).setdefault(qual, {})[name] = ("!" if hooked else "") + "%x" % bits
 
 if os.path.isdir(OUT):
     shutil.rmtree(OUT)

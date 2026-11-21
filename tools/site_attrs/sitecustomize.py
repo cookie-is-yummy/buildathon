@@ -19,6 +19,7 @@ Written to $BR_ATTR.<pid>.json at exit:
   creation  class id -> list of [key read during its creation, [computed names set earlier]]
   prewrapped  class ids whose body attributes were instrumented before creation hooks ran
   computed  class id -> names that appeared on the class during creation (not in its body)
+  late      keys of body attributes that could only be instrumented after class creation
 """
 import os
 import sys
@@ -65,10 +66,33 @@ if _OUT:
                     body = record["body"]
                     earlier = [n for n, v in objtype.__dict__.items()
                                if not (n.startswith("__") and n.endswith("__")) and (n not in body or body[n] is not v)]
-                record["reads"].append([self.key, sorted(earlier)])
+                record["reads"].add((self.key, tuple(sorted(earlier))))
             else:
                 _reads.add(self.key)
             return self.value
+
+    _late = set()  # attributes instrumented only after their class was created
+    _string_cache = {}
+
+    def _strings_in(filename):
+        names = _string_cache.get(filename)
+        if names is None:
+            import ast
+
+            names = set()
+            try:
+                with open(filename, encoding="utf-8") as fh:
+                    for node in ast.walk(ast.parse(fh.read())):
+                        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                            names.add(node.value)
+            except Exception:
+                names = None
+            _string_cache[filename] = names
+        return names if names is not None else _Everything()
+
+    class _Everything:
+        def __contains__(self, item):
+            return True
 
     _build_class = builtins.__build_class__
 
@@ -84,10 +108,16 @@ if _OUT:
             return _build_class(func, name, *bases, **kwargs)
         meta = types._calculate_meta(meta, resolved)
         meta_file = getattr(sys.modules.get(meta.__module__), "__file__", "") or ""
+        by_string = ()
         if meta in (type, abc.ABCMeta):
             prewrap = True
         elif meta_file.startswith(_SRC):
-            prewrap = False
+            # A sqlglot metaclass. It may fetch some attributes by name from the class
+            # dictionary (which would hand it our descriptor instead of the value), so
+            # every name that appears as a string in the metaclass's source file is left
+            # alone until the class exists. All other attributes are instrumented first.
+            prewrap = True
+            by_string = _strings_in(meta_file)
         else:
             return _build_class(func, name, *bases, **kwargs)  # Enum, NamedTuple, Protocol, ...
         class_id = filename[len(_ROOT) + 1:] + "::" + func.__qualname__
@@ -96,12 +126,15 @@ if _OUT:
         def proxy(name_, bases_, namespace, **kw):
             if prewrap:
                 for attr, value in list(namespace.items()):
+                    if attr in by_string:
+                        _late.add(prefix + attr)
+                        continue
                     if _is_data(attr, value):
                         key = prefix + attr
                         namespace[attr] = _Tracker(attr, value, key)
                         _wrapped.add(key)
             body = dict(namespace)  # the values as the class body left them (wrapped if prewrap)
-            record = {"qualname": func.__qualname__, "body": body, "reads": []}
+            record = {"qualname": func.__qualname__, "body": body, "reads": set()}
             _creating.append(record)
             try:
                 cls = meta(name_, bases_, namespace, **kw)
@@ -121,7 +154,7 @@ if _OUT:
             if prewrap:
                 _prewrapped.add(class_id)
             _computed.setdefault(class_id, set()).update(added)
-            _creation.setdefault(class_id, []).extend(record["reads"])
+            _creation.setdefault(class_id, set()).update(record["reads"])
             return cls
 
         prepare = getattr(meta, "__prepare__", None)
@@ -142,8 +175,10 @@ if _OUT:
             with open("%s.%d.json" % (_OUT, os.getpid()), "w") as fh:
                 json.dump({
                     "reads": sorted(_reads), "wrapped": sorted(_wrapped),
-                    "creation": _creation, "prewrapped": sorted(_prewrapped),
+                    "creation": {k: sorted([key, list(earlier)] for key, earlier in v) for k, v in _creation.items()},
+                    "prewrapped": sorted(_prewrapped),
                     "computed": {k: sorted(v) for k, v in _computed.items()},
+                    "late": sorted(_late),
                 }, fh)
         except Exception as error:
             print("attr recorder dump failed:", repr(error), file=sys.stderr)

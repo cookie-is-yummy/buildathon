@@ -49,6 +49,13 @@ Why alone and not in one big run: in one big run the first test to need somethin
 cache and later tests reuse it without executing the code. Each of those later tests still
 depends on that code. Alone, every test executes it itself and the dependency is visible.
 
+The opposite also happens: in a big run a later test can take a "cache hit" path that it
+never takes alone. So the whole suite was also recorded in one process, twice (normal and
+reversed order), with a marker per test, and the maps hold the **union** of everything.
+(It added only a few dozen line entries. In reversed order four tests fail at the pinned
+commit because they depend on state left by earlier tests; that told us the suite is not
+fully order-independent, which is one of the remaining risks listed below.)
+
 Opened files and listed directories come from Python's audit hook (`sys.addaudithook`),
 which reports every `open()`, `os.listdir()`, `os.scandir()`, `glob`. Each event is
 classed by what is on the call stack: the import system, repository code (sqlglot or the
@@ -85,9 +92,9 @@ match the pinned text: run everything). Then:
     becomes local, a `yield` appearing (the function becomes a generator), `global`
     declarations. Then any path through the function may change: select every test that
     **started running** that function or anything defined inside it.
-  - *A `def` or `class` header changed* (name, parameters, defaults, decorators, base
-    classes): the header runs at import, so everyone who imports the module is selected,
-    plus everyone who ran the function.
+  - *A `def` or `class` header changed* (name, parameters, decorators, base classes): the
+    header runs at import, so everyone who imports the module is selected, plus everyone
+    who ran the function. (Constant defaults are the exception, see below.)
   - *A statement at module or class level changed* (a constant, a class attribute, a
     mapping table). It runs at import time, and since the recordings include import time,
     its lines list exactly the tests that import the module. For core modules that is
@@ -99,12 +106,53 @@ match the pinned text: run everything). Then:
     module.
   - Code that no test executes (for example under `if TYPE_CHECKING:`) selects nothing.
 
+### Class attributes (the big tables)
+
+A lot of sqlglot is data in class bodies: `arg_types` of ~1000 expression classes, and the
+`TRANSFORMS`, `FUNCTIONS`, `TYPE_MAPPING`, `KEYWORDS` tables and feature flags of every
+dialect. A change there runs at import, so the line map can only say "everyone who imports
+the module", which for core modules is every test.
+
+So a second recording asks a sharper question: **which tests read which class attribute?**
+During that recording every data attribute in a sqlglot class body is replaced by a small
+descriptor object that notes each read and returns the real value. Reading the attribute
+through an instance, the class or a subclass all go through the descriptor of the class
+that *defines* it, which is exactly the dependency we need.
+
+Two complications, both handled when the map is built:
+
+- **Values computed from attributes.** When a class is created, `__init_subclass__` hooks
+  and metaclasses compute more attributes (`required_args` from `arg_types`; tries and
+  inverse mappings for dialects). The recorder watches class creation: a computed
+  attribute depends on every attribute read before it was set. Tests reading the computed
+  attribute are added to the readers of what it was computed from. For classes with one of
+  sqlglot's own metaclasses the recorder cannot see reads of the class's own body, so
+  every computed attribute of such a class is assumed to depend on every body attribute.
+- **Later statements in the same class body** that use the name (`B = {**A, ...}`):
+  readers of `B` are added to readers of `A`. If the name is used at class-creation time in
+  any way we cannot follow, the attribute is left out of the map.
+
+The selector uses this map only when the edit **cannot make the class body fail at
+import**: a constant replaced by a constant of the same type inside a literal, or (when no
+creation hook reads the attribute) entries removed from a literal. Anything else, for
+example a changed argument of a call such as `re.compile(...)`, could raise while the
+module is imported and fail every importer, so it falls back to all importers.
+
+### Function defaults
+
+If only constant default values of a function's parameters change, the header still runs
+at import but cannot fail, and a default is only looked at when the function is called:
+select the tests that started the function.
+
 ### Docstrings
 
 pytest does not collect sqlglot's doctests (`tests/test_docs.py` uses unittest's
 `load_tests`, which pytest ignores; it contributes no test to `tests.json`). A docstring
-inside a function is a statement no test executes, so it selects nothing. A class or
-module docstring is a class/module-level statement and selects the importers.
+inside a function is a statement no test executes, so it selects nothing. For class and
+module docstrings the map build scans the pinned tree for code that tests execute and that
+touches `__doc__`: the only one copies a class's docstring back onto itself. So a
+docstring whose text changes (non-empty before and after) selects nothing. Adding or
+removing a docstring is a statement added or removed and selects the importers.
 
 ### A test file, test helper or fixture was modified
 
