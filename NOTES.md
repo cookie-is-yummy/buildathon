@@ -202,8 +202,12 @@ file are selected. If it no longer parses or gains pytest settings: run everythi
   repository root is on the import path and such files can change pytest or shadow a
   module (in our test set a new top-level `json.py` broke all 1620 tests). A new
   directory can only become a "namespace package", which never shadows a real module, so
-  it matters only to tests that tried to import that name. A new test module selects nothing unless its top level does
-  more than import and define things.
+  it matters only to tests that tried to import that name. A new test module selects
+  nothing (its tests are not in the list we choose from) as long as importing it only
+  defines things: plain imports, functions without decorators, test classes whose base
+  is `TestCase` or `Validator`, and constants. Anything else at its top level (a
+  decorator, a call, a class with another base, which might register itself somewhere)
+  could change state other tests see, so we run everything.
 - **Renamed**: a deletion plus an addition.
 
 ### Files nobody uses
@@ -281,7 +285,7 @@ real tests are then run on each patch to learn which fail.
 
 | Set | How ground truth was obtained | Patches | With failures | Misses |
 | --- | --- | --- | --- | --- |
-| Mixed kinds | full suite (`tools/gt_loop.sh`) | 59 of 155 so far | 40 | 0 |
+| Mixed kinds | full suite (`tools/gt_loop.sh`) | 155 | 101 | 0 |
 | Class-attribute and lambda rules | full suite | 26 | 19 | 0 |
 | Dialect-specific modules | only the tests that import the patched module (`tools/fast_gt.py`): no other test can be affected | 287 | 191 | 0 |
 | Dialect, executor and optimizer modules, and test files | importers only | 182 | 139 | 0 |
@@ -289,6 +293,11 @@ real tests are then run on each patch to learn which fail.
 In the third set the selector chose 25,242 tests in total where "every importer" would be
 94,215. One patch there turned a loop infinite and exhausted memory, killing the test
 process; the 133 importers we did not select were then run separately and all passed.
+
+In the mixed set, two full-suite runs did not finish inside the 20-minute limit (one
+patch makes the tokenizer loop forever, the other makes almost every test fail slowly).
+For those two, every test the selector had left out was run separately under the patch:
+1597 of 1597 and 274 of 274 passed.
 
 The ground-truth method was checked against the organisers' answers: running the full
 suite on three sample patches reproduced their failing sets exactly.

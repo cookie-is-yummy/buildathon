@@ -15,11 +15,10 @@ for cid, m in meta.items():
         # The full run did not finish (tests hang or fail very slowly under this patch).
         # <id>.rest holds a second run of only the tests the selector left out: those that
         # passed there are known to pass, everything else is counted as failing. Without
-        # such a run there is no verdict and the patch is skipped.
+        # such a run every test is counted as failing (true when pytest cannot start at
+        # all; otherwise a reported miss is the cue to make that second run).
         rest = os.path.join(syn, "gt", cid + ".rest")
-        if not os.path.exists(rest):
-            continue
-        ok = set(json.load(open(rest))["passed"])
+        ok = set(json.load(open(rest))["passed"]) if os.path.exists(rest) else set()
         failing = strict = [t["number"] for t in tests if t["id"] not in ok]
     else:
         passed = set(r["passed"]); failed = set(r["failed"]); cf = set(r["collect_failed"])
