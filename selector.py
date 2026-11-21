@@ -1176,6 +1176,9 @@ def select_change(change, maps, notes):
 
 
 def select(patch_text, maps, notes):
+    if not patch_text.strip():
+        notes.append("empty patch: nothing changed")
+        return 0
     bits = 0
     for change in parse_patch(patch_text):
         bits |= select_change(change, maps, notes)
