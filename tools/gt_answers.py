@@ -12,8 +12,15 @@ for cid, m in meta.items():
     if r.get("applyfail"):
         continue
     if r.get("crash"):
-        failing = [t["number"] for t in tests]
-        strict = failing
+        # The full run did not finish (tests hang or fail very slowly under this patch).
+        # <id>.rest holds a second run of only the tests the selector left out: those that
+        # passed there are known to pass, everything else is counted as failing. Without
+        # such a run there is no verdict and the patch is skipped.
+        rest = os.path.join(syn, "gt", cid + ".rest")
+        if not os.path.exists(rest):
+            continue
+        ok = set(json.load(open(rest))["passed"])
+        failing = strict = [t["number"] for t in tests if t["id"] not in ok]
     else:
         passed = set(r["passed"]); failed = set(r["failed"]); cf = set(r["collect_failed"])
         strict = [t["number"] for t in tests if t["id"] in failed or t["file"] in cf]
