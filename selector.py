@@ -24,7 +24,13 @@ PINNED = os.path.join(HERE, "pinned")
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 # Wall-clock budget for the whole batch. Past it, every remaining commit runs all tests.
-TIME_BUDGET_SECONDS = float(os.environ.get("BLAST_BUDGET", "130"))
+# Wall-clock limits. The run gets 3 minutes for the practice batch and 4.5 for the final,
+# which has about one and a half times as many commits (6 seconds a commit either way),
+# so our own limits grow with the number of commits too, and stay well below that:
+# 4 s a commit for everything (then the remaining commits run every test), of which at
+# most 1.5 s a commit for replays and 1.6 s a commit for running candidates.
+TIME_BUDGET_SECONDS = float(os.environ.get("BLAST_BUDGET", "0"))  # 0: by the number of commits
+SECONDS_PER_COMMIT = 4.0
 # Fill spare room on workers with further tests at no cost (see fill). BLAST_FILL=0 turns
 # it off, which the evaluation does: it must see what the rules alone select.
 FILL = os.environ.get("BLAST_FILL", "1") != "0"
@@ -1663,7 +1669,7 @@ REPLAY_PROGRAM = os.path.join(HERE, "replay.py")
 # Replaying is worth its CPU seconds only if they are clearly fewer than what dropping
 # the test would save: replay when (estimated CPU) <= REPLAY_WORTH * (seconds saved).
 REPLAY_WORTH = 0.6
-REPLAY_TOTAL_SECONDS = float(os.environ.get("BLAST_REPLAY_TOTAL", "45"))  # wall clock for all replays of one run
+REPLAY_TOTAL_SECONDS = float(os.environ.get("BLAST_REPLAY_TOTAL", "0"))  # wall clock for all replays; 0: 1.5 s a commit
 REPLAY_START_SECONDS = 0.6   # starting Python and importing the pinned sqlglot
 
 
@@ -1691,6 +1697,7 @@ class Replayer:
         if len(baseline["full"]["0"]) != len(self.seconds["full"]):
             raise ValueError("baseline and map disagree")
         self.spent = 0.0
+        self.total = 45.0  # wall-clock seconds for all runs; main() sets it by the number of commits
 
     def narrow(self, bits, other, traced, maps, notes):
         if not bits & self.bit or other & self.bit or bits == maps.all_bits:
@@ -1735,7 +1742,7 @@ class Replayer:
         saved = self.saving(bits, maps)
         # what one run may use at most: where a plan differs, that query is executed after all
         self.limit = max(estimate, REPLAY_WORTH * saved)
-        if estimate > REPLAY_WORTH * saved or self.spent + estimate > REPLAY_TOTAL_SECONDS:
+        if estimate > REPLAY_WORTH * saved or self.spent + estimate > self.total:
             notes.append("replay not worth it (%.1f s for %d+%d queries, %.1f s to save)" % (estimate, len(plan), len(full), saved))
             return bits
         started = time.monotonic()
@@ -1799,7 +1806,7 @@ TREE = os.environ.get("BLAST_TREE", "/tmp/blast-tree")
 # Running candidates here is worth it when their CPU seconds are clearly fewer than what
 # handing them out costs: run when (estimated CPU) <= VERIFY_WORTH * (seconds saved if all pass).
 VERIFY_WORTH = float(os.environ.get("BLAST_VERIFY_WORTH", "0.5"))
-VERIFY_TOTAL_SECONDS = float(os.environ.get("BLAST_VERIFY_TOTAL", "50"))  # wall clock for one run
+VERIFY_TOTAL_SECONDS = float(os.environ.get("BLAST_VERIFY_TOTAL", "0"))  # wall clock for all such runs; 0: 1.6 s a commit
 
 
 class Tree:
@@ -1859,6 +1866,7 @@ class Verifier:
         self.duration = duration
         self.tree = None
         self.spent = 0.0
+        self.total = 45.0  # wall-clock seconds for all runs; main() sets it by the number of commits
 
     def cost(self, numbers):
         workers = split(numbers, self.duration)
@@ -1877,7 +1885,7 @@ class Verifier:
             first[name] = max(first.get(name, 0.0), self.cpu[n][1])
         estimate = self.start + sum(self.cpu[n][0] for n in candidates) + sum(first.values())
         saved = self.cost(numbers) - self.cost(rest)
-        if estimate > VERIFY_WORTH * saved or self.spent + estimate > VERIFY_TOTAL_SECONDS:
+        if estimate > VERIFY_WORTH * saved or self.spent + estimate > self.total:
             notes.append("%d candidates not run here (%.1f s, %.1f s to save)" % (len(candidates), estimate, saved))
             return numbers, []
         # the patched files: only plain modifications of text files we hold
@@ -2038,10 +2046,12 @@ def main():
     except Exception as error:  # without maps the only safe answer is everything
         log("maps failed to load:", repr(error))
 
+    budget = TIME_BUDGET_SECONDS or max(60.0, SECONDS_PER_COMMIT * len(commit_ids))
     replayer = None
     try:
         if maps is not None and os.path.exists(REPLAY_BASELINE):
             replayer = Replayer(maps, duration)
+            replayer.total = REPLAY_TOTAL_SECONDS or max(20.0, 1.5 * len(commit_ids))
     except Exception as error:  # without it the slow test is simply never dropped this way
         log("replay unavailable:", repr(error))
     verifier = None
@@ -2049,6 +2059,7 @@ def main():
         # the two marker files tell that the image has the packages sqlglot and its tests import
         if maps is not None and os.path.exists(REPLAY_BASELINE) and os.path.exists(VERIFY_MARK) and os.path.exists(VERIFY_MAP):
             verifier = Verifier(maps, [t["id"] for t in tests], duration)
+            verifier.total = VERIFY_TOTAL_SECONDS or max(20.0, 1.6 * len(commit_ids))
     except Exception as error:
         log("running candidates unavailable:", repr(error))
 
@@ -2058,7 +2069,7 @@ def main():
         try:
             if maps is None:
                 raise RunEverything("no maps")
-            if time.monotonic() - started > TIME_BUDGET_SECONDS:
+            if time.monotonic() - started > budget:
                 raise RunEverything("time budget")
             with open(os.path.join(commits_dir, commit + ".patch"), encoding="utf-8", newline="") as handle:
                 patch_text = handle.read()

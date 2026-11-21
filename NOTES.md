@@ -325,7 +325,7 @@ Two refinements:
 
 It is only attempted when it pays: the estimated CPU (recorded per query) must be at most
 0.6 of what dropping the test would save, one replay may not use more than that either,
-and all replays of a run share a 45-second budget. The CPU seconds are part of the score, so they are in the results table.
+and all replays of a run share a budget of 1.5 seconds per commit of the batch. The CPU seconds are part of the score, so they are in the results table.
 
 The replay needs sqlglot to behave as it does where the tests run. sqlglot imports two
 third-party packages if present (`dateutil` for date arithmetic, `mypy_extensions`); the
@@ -371,7 +371,7 @@ patched code, in the image, and hands out only the ones that do not pass.
   pickling of arguments and results. DuckDB gets two threads.
 - **When.** The map holds each test's CPU seconds. Candidates are run when the estimate
   is at most VERIFY_WORTH times what the commit would cost less if they all passed, and
-  all such runs share a 50-second budget. A patch that changes no Python file (a fixture
+  all such runs share a budget of 1.6 seconds per commit of the batch. A patch that changes no Python file (a fixture
   edit) is not run: the tests that read a changed fixture are expected to fail.
 - **Stopping early.** After a failure the run checks whether going on can still pay:
   with the failures so far, how much less can the commit still cost, against the CPU the
@@ -483,7 +483,9 @@ nothing. The evidence is the recording of every file opened during the whole sui
 
 - Every commit is wrapped: any exception, and any patch the parser does not fully
   understand, falls back to running every test for that commit.
-- A wall-clock budget: past it, remaining commits run everything.
+- A wall-clock budget of 4 seconds per commit of the batch (the scorer allows 6): past
+  it, remaining commits run everything. Replays and candidate runs have their own,
+  smaller budgets inside it; past those, tests simply stay selected.
 - A test in `tests.json` that the maps do not know is added to every non-empty selection.
 - Only JSON lines go to stdout; all diagnostics go to stderr.
 
