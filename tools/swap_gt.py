@@ -31,9 +31,14 @@ for i, cid in enumerate(sorted(meta)):
     if os.path.exists(result):
         os.remove(result)
     try:
+        # Whole files are given to pytest and the plugin keeps the wanted tests: with node
+        # ids on the command line, one file that cannot be imported would stop everything.
+        # A test fails if its own file cannot be imported; tests of other files still run.
+        files = sorted({test.split("::")[0] for test in info["dropped"]})
         run = subprocess.run(
-            [sys.executable, "-m", "pytest", "@" + args, "-p", "no:cacheprovider", "-p", "gt_plugin", "-q", "--timeout=300"],
-            cwd=work, env=dict(env, GT_OUT=result), capture_output=True, text=True, timeout=1500)
+            [sys.executable, "-m", "pytest", *files, "-p", "no:cacheprovider", "-p", "gt_plugin", "-q", "--timeout=300",
+             "--continue-on-collection-errors"],
+            cwd=work, env=dict(env, GT_OUT=result, GT_ONLY=args), capture_output=True, text=True, timeout=1500)
         tail = run.stdout.strip().split("\n")[-1][:200]
     except subprocess.TimeoutExpired:
         tail = "TIMEOUT"

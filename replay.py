@@ -28,15 +28,20 @@ Executing a plan over the data is the expensive step. For a query in which the p
 statements are only executed BEFORE that step (parsing, optimizing, planning), it is
 enough to compare what goes into the step: the plan and the tables. If those are
 unchanged, the step runs the same code on the same input. Such queries are replayed
-"up to the plan"; the others are executed.
+"up to the plan"; the others are executed. If a plan does differ, that query is executed
+too and its rows decide.
 
 The fingerprint walks the returned objects completely (every attribute, in order, with
 shared objects noted as shared) without calling any of their methods.
 
 usage:
-  replay.py run <root> <expected.json> <seed> <queries> <queries> [<rel path>=<patched file> ...]
+  replay.py run <root> <expected.json> <seed> <queries> <queries> <budget.json> [<rel path>=<patched file> ...]
         first list: queries to replay up to the plan; second list: queries to execute
-        ("-" for none). Prints "same", or "differs <query>" at the first that differs
+        ("-" for none). Prints "same", or "differs <query>" at the first that differs.
+        A query of the first list whose plan differs is executed after all: a different
+        plan can still give the same rows. budget.json holds the CPU seconds this run may
+        use and what each query takes; when the run cannot finish within the limit (plans
+        differing everywhere, say), the answer is "differs" at once.
   replay.py baseline <root> <output.json>
         the pinned fingerprints, for several hash seeds (run at image build)
   replay.py show <root> <plan|full>
@@ -379,16 +384,34 @@ def main(argv):
         print(json.dumps({str(number): replay_one(meta, sql, schema, tables, argv[3] == "full")
                           for number, (meta, sql, _) in enumerate(pairs)}))
         return
+    import time
+
     expected, seed = json.load(open(argv[3])), argv[4]
     wanted = [[int(n) for n in text.split(",")] if text != "-" else [] for text in argv[5:7]]
-    patched = dict(item.split("=", 1) for item in argv[7:])
+    budget = json.load(open(argv[7]))  # {"limit": cpu seconds, "plan": [per query], "full": [per query]}
+    patched = dict(item.split("=", 1) for item in argv[8:])
     pairs, schema, tables = prepare(root, patched)
-    for run, numbers in ((False, wanted[0]), (True, wanted[1])):
-        for number in numbers:
-            meta, sql, _ = pairs[number]
-            if replay_one(meta, sql, schema, tables, run) != expected["full" if run else "plan"][seed].get(str(number)):
+    looked = differing = 0
+    for position, number in enumerate(wanted[0]):
+        meta, sql, _ = pairs[number]
+        looked += 1
+        if replay_one(meta, sql, schema, tables, False) != expected["plan"][seed].get(str(number)):
+            # Another plan: do the rows still come out the same? Only if there is room for
+            # it: this query, and as large a share of the remaining ones as differed so far.
+            differing += 1
+            ahead = sum(budget["plan"][q] + differing / looked * budget["full"][q] for q in wanted[0][position + 1:])
+            ahead += sum(budget["full"][q] for q in wanted[1])
+            if time.process_time() + budget["full"][number] + ahead > budget["limit"]:
+                print("differs %d (no room to execute it)" % number)
+                return
+            if replay_one(meta, sql, schema, tables, True) != expected["full"][seed].get(str(number)):
                 print("differs %d" % number)
                 return
+    for number in wanted[1]:
+        meta, sql, _ = pairs[number]
+        if replay_one(meta, sql, schema, tables, True) != expected["full"][seed].get(str(number)):
+            print("differs %d" % number)
+            return
     print("same")
 
 

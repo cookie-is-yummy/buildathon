@@ -292,8 +292,11 @@ It takes a fingerprint of everything the calls return (the object graphs are wal
 completely, without calling any method). The fingerprints of the pinned code are computed
 when the image is built. The selector drops the test only when **all** of this holds:
 
-1. Everything in the patch that the test executes is a statement inside a function, in a
+1. Everything in the patch that the test executes is a statement inside a function, or a
+   function changed as a whole (a default argument, a name that becomes local), in a
    file under `sqlglot/` (no class-level or module-level code, no test file, no fixture).
+   For a function changed as a whole, every line of its body that the test executes
+   counts as changed.
 2. The test executes each of those statements inside the three calls and nowhere else.
    A recording of the real test, in all its processes, says for every line whether it
    ran inside or outside the calls (`tools/site_replay`, three runs, identical).
@@ -311,16 +314,18 @@ Two refinements:
 
 - **Up to the plan.** Executing the plan over the data is the expensive step. For a
   query in which the patched statements run only before that step, comparing what goes
-  *into* it (the plan and the tables) is enough, at a tenth of the cost. The recording
-  keeps the two apart per line and per query.
+  *into* it (the plan and the tables) is enough, at a third of the cost. The recording
+  keeps the two apart per line and per query. If the plan does differ, the query is
+  executed after all and its rows decide: an optimizer change often gives another plan
+  with the same result.
 - **Hash seeds.** One query is parsed with its modifiers in an order that follows the
   iteration order of a set, so its fingerprint depends on Python's hash seed. Baselines
   exist for six seeds; the replay runs once per distinct pinned behaviour of the queries
   involved (normally once, twice if that query is among them), with the seed fixed.
 
 It is only attempted when it pays: the estimated CPU (recorded per query) must be at most
-half of what dropping the test would save, and all replays of a run share a 45-second
-budget. The CPU seconds are part of the score, so they are in the results table.
+0.6 of what dropping the test would save, one replay may not use more than that either,
+and all replays of a run share a 45-second budget. The CPU seconds are part of the score, so they are in the results table.
 
 The replay needs sqlglot to behave as it does where the tests run. sqlglot imports two
 third-party packages if present (`dateutil` for date arithmetic, `mypy_extensions`); the
@@ -332,6 +337,62 @@ arguments, and that they leave nothing behind in the process that later steps re
 without going through the changed statement. Point 3 checks the second assumption as far
 as coverage can show it. It is checked end to end by running the real test on patched
 trees where the replay said "same" (see the left-out-tests check).
+
+### Running cheap candidates in the image (verify.py)
+
+After the rules above, the selected tests are *candidates*: each executes something the
+patch changed. Many of them still pass. Handing a candidate out costs at least the 2
+seconds of a worker; running it here costs its CPU time, which for most sqlglot tests is
+a few milliseconds. So when the candidates are cheap, the selector runs them on the
+patched code, in the image, and hands out only the ones that do not pass.
+
+- **Allowed, and what "fails" means.** The kit's README says: "Running sqlglot's tests
+  while you decide is allowed, and you pay for the time", and: "'Fails' means pytest
+  reports a failure, an error or a timeout for the test, or the test's file cannot be
+  imported. A test with subtests is one test."
+- **What runs.** sqlglot's tests are plain `unittest` cases (its own `make test` is
+  `python -m unittest`). `verify.py` loads the candidates and runs them with unittest in
+  one process, in suite order. "Not passed" means failed, errored, a failing subtest, an
+  unexpected success, skipped (a skip is no evidence of passing), a test file that
+  cannot be imported, or a class that could not be set up. A run that exceeds its time limit tells us nothing and keeps every candidate.
+- **On what.** A copy of the pinned tree in `/tmp`, made of symbolic links, in which the
+  patched files are real files. Tests that start further Python processes (the optimizer
+  tests use a process pool, one dialect test runs `python -c`) get the patched code
+  there too. Only patches that modify text files we hold are handled; anything else
+  (added, deleted, renamed, binary) keeps the selection as it is.
+- **Which tests.** Only tests in `maps/verify.json`: tests that pass in this image at the
+  pinned commit when run alone in a fresh process (twice) and when run with the rest of
+  their file. That is 1,557 of the 1,620. The executor tests are not among them (they
+  need the TPC-H tables, which are not shipped); for the slow one there is the replay.
+  A test that is not in the map is never run here and stays selected.
+- **Kept small.** The optimizer tests hand every fixture case to a process pool. A real
+  pool starts one worker per CPU of the host, each importing DuckDB and pandas; here the
+  pool is replaced by a stand-in that runs each call in the same process, with the same
+  pickling of arguments and results. DuckDB gets two threads.
+- **When.** The map holds each test's CPU seconds. Candidates are run when the estimate
+  is at most VERIFY_WORTH times what the commit would cost less if they all passed, and
+  all such runs share a 50-second budget. A patch that changes no Python file (a fixture
+  edit) is not run: the tests that read a changed fixture are expected to fail.
+- **Stopping early.** After a failure the run checks whether going on can still pay:
+  with the failures so far, how much less can the commit still cost, against the CPU the
+  remaining candidates need. If not, it stops; candidates that were not run stay
+  selected. So a patch that breaks most of its candidates costs a fraction of a second.
+- **Afterwards.** Tests that passed here are the first to be put into spare room on the
+  workers (step 4), so where room exists they are run by the scorer anyway.
+
+What this rests on: a test that passes here on the patched code also passes where the
+organisers ran it. The image has the same Python and the same versions of every package
+sqlglot and its tests import (`requirements.lock`). It differs in what else ran in the
+process before the test, and in Python's hash seed. A test whose result depends on
+either would be at risk; the map leaves out tests that behave differently alone and in
+their file at the pinned commit, which is the part of this we can observe.
+
+It was checked against the organisers' own answers: forced on for every sample commit,
+the tests reported as not passing are exactly the organisers' failing tests, for every
+test in the map (0 missed, 0 extra). And against pytest on two sets of 60 random
+single-token changes each (see the evaluation sets): forced on, 98 commits were run here,
+several with more than a thousand candidates; no test that fails under pytest passed
+here, and no test that passes under pytest was reported as failing.
 
 ### Tests that inspect code instead of running it
 
@@ -454,7 +515,14 @@ Listed from most to least worrying.
    everything (36.8 s), so surprises cost time, not misses, unless they slip through one
    of the rules above in a way we did not think of.
 6. **Timeouts.** A patch that makes a test hang counts as a failure. Such a test executes
-   the changed statement, so it is selected; this needs no special handling.
+   the changed statement, so it is selected; this needs no special handling. A helper
+   program that runs into its own time limit decides nothing: the tests stay selected.
+7. **A test that passes in the image and fails where the organisers ran it.** The step
+   that runs candidates here trusts the image: same Python, same package versions, but
+   a fresh process with only the candidates in it and its own hash seed. A test whose
+   result under a patch depends on the hash seed, or on what other tests ran before it,
+   could differ. We found no such case in about a hundred commits compared with pytest,
+   and none in the sample answers; it cannot be ruled out.
 
 ## Mistakes made along the way
 
@@ -469,6 +537,13 @@ Listed from most to least worrying.
   recorded again, and the checks were repeated from scratch on the new maps.
 - The same first version also made the recording extremely slow (the question re-entered
   `Expression.__eq__` until Python's recursion limit, on every comparison of expressions).
+
+- **A skipped test looked like a passing one.** The first version of the program that
+  runs candidates in the image counted a skipped test as passed. A test that is skipped
+  here might run, and fail, elsewhere. A hand-made patch that adds a skip decorator
+  showed it. Skips now keep the test selected.
+- **Ground truth that said "everything fails".** See the note on the ground-truth tools
+  under "Local evaluation sets": two apparent misses were the tool's, not the selector's.
 
 ## Results log
 
@@ -489,7 +564,9 @@ Listed from most to least worrying.
 
 | + replay of the slow executor test; spare room on workers filled | 117.425 | 0 | 1.03 | mixed set 1504.8 s -> 1448.3 s, 0 misses; the other sets unchanged, 0 misses; replay check below |
 
-The board score of the previous step was 193.3 s against 117.4 s on the sample: the
+| + replay extended (whole functions; a different plan with the same rows); cheap candidates run in the image | 112.960 | 0 | 2.8 | see "Through the image" below: all seven sets 0 misses |
+
+The board score of the step before the replay was 193.3 s against 117.4 s on the sample: the
 board's commits happen to select the slow executor test more often. Over every possible
 single-token change (one file drawn at random, then one place in it), the expected cost
 of a code commit was 7.2 s, two thirds of it from commits that select that test. That is
@@ -532,6 +609,39 @@ For those two, every test the selector had left out was run separately under the
 The ground-truth method was checked against the organisers' answers: running the full
 suite on three sample patches reproduced their failing sets exactly.
 
+Two more sets were made to look like the organisers' code commits: one single-token
+change per commit (`and`/`or`, comparison operator, `True`/`False`, number + 1, `not`
+removed), the file drawn at random from `sqlglot/`, then the place. In the first the
+kind of change follows from what the file contains; in the second the kinds are drawn
+in the proportions of the sample. 60 commits each. Ground truth: pytest on the tests
+the rules select (or the whole suite when they select none), one commit left out
+because the patched code never finishes. 44 and 48 of them break at least one test.
+
+One correction to the ground-truth tools came out of this: when a test file cannot be
+imported, pytest given test ids stops the whole session, and the tool then counted every
+test as failing. The kit defines "fails" per test (a test whose own file cannot be
+imported fails; the others are judged on their own), so the tool now gives pytest whole
+files with `--continue-on-collection-errors` and keeps the wanted tests in a plugin.
+
+#### Through the image, all steps on, spare-room filling off
+
+Simulated seconds, and next to them the CPU seconds the two helper programs used (they
+are part of the score). "Rules only" is the selection before replay and candidate runs.
+
+| Set | Commits | Rules only | Now: simulated + helper CPU | Misses |
+| --- | --- | --- | --- | --- |
+| Sample | 30 | 117.4 | 113.0 + 2.8 | 0 |
+| Organiser-like, first | 59 | 450.7 | 344.2 + 36.2 | 0 |
+| Organiser-like, second | 60 | 418.8 | 365.2 + 30.7 | 0 |
+| Mixed kinds | 155 | 1504.8 | 1421.8 + 31.7 | 0 |
+| Class-attribute and lambda rules | 26 | 282.1 | 241.9 + 12.1 | 0 |
+| Hand-made unusual kinds | 42 | 473.5 | 471.0 + 2.0 | 0 |
+
+What is left on the two organiser-like sets is mostly out of reach for a sound rule: a
+few commits change code that runs when a core module is imported (a metaclass, a base
+class). Every test executes it, a handful fail, and the two slowest tests cannot be
+decided for less CPU than they cost to hand out.
+
 ### The left-out-tests check (for the comparison and `and`/`or` rules)
 
 The sets above mostly tell us about patches that make tests fail. These rules are about
@@ -547,19 +657,20 @@ Every one of them must pass. A single failure means the rule or the recording is
 | Comparison operator swapped, shipped maps, a fresh draw of patches | 400 | 43,713 | 0 |
 | `and` <-> `or` (200 each way) | 400 | 39,876 | 0 |
 | Later operand: the operand replaced by an expression that raises as soon as it is evaluated | 400 | 51,721 | 0 |
-| Replay of the slow executor test said "same": the real test run on the patched tree | 46 | 46 | 0 |
+| Replay of the slow executor test said "same": the real test run on the patched tree | 67 | 67 | 0 |
+| Candidates run in the image, forced on for every commit of the two organiser-like sets, against pytest | 98 | every candidate | 0 passed here but failing there, 0 the other way |
 
 For the later-operand rule the replacement is the harshest possible change: any left-out
 test that evaluates the operand even once crashes.
 
 The replay row comes from a different draw: 140 random single-token changes (`and`/`or`,
 comparison, `True`/`False`, number + 1, `not` removed) on lines the replay map covers, one
-file at random and then one place in it. Run through the image: 116 replays attempted,
-46 "same", 70 "differs" (a difference ends a replay early: 1.1 s on average, against
-4.3 s when everything is the same), 19 judged not worth the CPU, 5 not eligible after
-all. All 46 were then run for real (45 CPU-seconds each): 46 pass. 46 cases cannot show
-a failure rate below a few percent, so this check is weaker than the three above; what
-carries the rule is the argument in "Replaying the slow executor test".
+file at random and then one place in it. Run through the image: 117 replays attempted,
+66 "same" (4.6 s each on average), 51 "differs" (1.0 s on average, because a difference
+ends a replay early), the rest judged not worth the CPU. Every "same" was then run for
+real (45 CPU-seconds each), 67 patches over the versions of the rule: all pass. That
+cannot show a failure rate below a few percent, so this check is weaker than the three
+above; what carries the rule is the argument in "Replaying the slow executor test".
 
 History, so the numbers are not read as more than they are. The comparison check was
 run with the first recording. After the recorder was rewritten (see "Mistakes"), the

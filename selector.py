@@ -24,7 +24,7 @@ PINNED = os.path.join(HERE, "pinned")
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 # Wall-clock budget for the whole batch. Past it, every remaining commit runs all tests.
-TIME_BUDGET_SECONDS = float(os.environ.get("BLAST_BUDGET", "100"))
+TIME_BUDGET_SECONDS = float(os.environ.get("BLAST_BUDGET", "130"))
 # Fill spare room on workers with further tests at no cost (see fill). BLAST_FILL=0 turns
 # it off, which the evaluation does: it must see what the rules alone select.
 FILL = os.environ.get("BLAST_FILL", "1") != "0"
@@ -78,7 +78,8 @@ class Maps:
         # True: answer as if the comparison and and/or recordings did not exist
         self.plain = False
         # Set by select_python for the Replayer: (path, new text, line ranges of changed
-        # statements inside functions, tests selected for any other reason)
+        # statements inside functions, tests selected for any other reason, body line
+        # ranges of functions changed as a whole)
         self.trace = None
 
     def index(self, path):
@@ -589,7 +590,14 @@ def _function_body_range(function):
     """The whole definition, decorators included. Used with Maps.started(): a test is
     affected by a structural change to a function only if it started running the function
     or something defined inside it."""
-    return _def_first_line(function), function.end_lineno
+    found = _def_first_line(function), function.end_lineno
+    _BODY_START[found] = function.body[0].lineno
+    return found
+
+
+# (first line, last line) of a definition -> first line of its body (after the header,
+# which runs when the module is imported, not when the function is called)
+_BODY_START = {}
 
 
 def _only_lambda_bodies_differ(a, b, found):
@@ -1343,9 +1351,11 @@ def select_python(change, maps, notes):
         return bits | maps.importers(path)
     if diff.docstrings and not maps.fact("docstrings_unused"):
         return bits | maps.importers(path)
+    other = bits  # selected for a reason other than "executes these lines of a function"
+    bodies = []   # (first line of the body, last line) of functions changed as a whole
     for first, last in diff.functions:
         bits |= maps.started(path, first, last)
-    other = bits  # selected for a reason other than "executes these lines of a function"
+        bodies.append((_BODY_START.get((first, last), first), last))
     ranges = list(diff.statements)
     for first, last in diff.statements:
         bits |= maps.covering(path, first, last)
@@ -1411,7 +1421,7 @@ def select_python(change, maps, notes):
             found = (maps.covering(path, lines[0], lines[1]),)
         bits |= found[0]
         other |= found[0]
-    maps.trace = (path, new_text, ranges, other)
+    maps.trace = (path, new_text, ranges, other, bodies)
     notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s), %d operator(s) %s" % (
         path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes), len(diff.swaps),
         "; ".join(diff.reasons[:2])))
@@ -1616,13 +1626,36 @@ def select(patch_text, maps, notes, replayer=None):
             other |= found
         else:
             other |= maps.trace[3]
-            traced.append(maps.trace[:3])
+            traced.append((maps.trace[0], maps.trace[1], maps.trace[2], maps.trace[4]))
     if replayer is not None and traced:
         bits = replayer.narrow(bits, other, traced, maps, notes)
     return bits
 
 
 # --------------------------------------------------------------------------- replay
+
+
+def run_program(arguments, environment, directory, seconds, capture=False):
+    """Run one of our helper programs with a time limit. On time-out everything it
+    started is killed with it. Returns (exit status or None on time-out, its output)."""
+    import signal
+    import subprocess
+
+    process = subprocess.Popen(
+        [sys.executable, "-B", "-s"] + arguments, env=environment, cwd=directory, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        output = process.communicate(timeout=seconds)[0]
+        return process.returncode, output
+    except subprocess.TimeoutExpired:
+        return None, b""
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)  # whatever is left of its process group
+        except OSError:
+            pass
+        process.wait()
+
 
 REPLAY_MAP = os.path.join(MAPS, "replay.json")
 REPLAY_BASELINE = os.path.join(HERE, "baseline.json")
@@ -1663,15 +1696,19 @@ class Replayer:
         if not bits & self.bit or other & self.bit or bits == maps.all_bits:
             return bits
         every = running = 0
-        for path, _, ranges in traced:
+        for path, _, ranges, bodies in traced:
             eligible = self.lines.get(path, {})
-            for first, last in ranges:
+            for whole, (first, last) in [(False, r) for r in ranges] + [(True, r) for r in bodies]:
+                executed = False
                 for line in range(first, last + 1):
                     if maps.covering(path, line, line) & self.bit:
                         if line not in eligible:
                             return bits  # the test also executes it outside the calls
+                        executed = True
                         every |= eligible[line][0]
                         running |= eligible[line][1]
+                if whole and not executed and maps.started(path, first, last) & self.bit:
+                    return bits  # started the function, but we cannot say where
         count = len(self.seconds["full"])
         full = [q for q in range(count) if running >> q & 1]
         plan = [q for q in range(count) if every >> q & 1 and not running >> q & 1]
@@ -1696,6 +1733,8 @@ class Replayer:
         estimate = sum(REPLAY_START_SECONDS + sum(self.seconds["full"][q] for q in f) + sum(self.seconds["plan"][q] for q in p)
                        for _, p, f in runs)
         saved = self.saving(bits, maps)
+        # what one run may use at most: where a plan differs, that query is executed after all
+        self.limit = max(estimate, REPLAY_WORTH * saved)
         if estimate > REPLAY_WORTH * saved or self.spent + estimate > REPLAY_TOTAL_SECONDS:
             notes.append("replay not worth it (%.1f s for %d+%d queries, %.1f s to save)" % (estimate, len(plan), len(full), saved))
             return bits
@@ -1720,33 +1759,197 @@ class Replayer:
 
     def run(self, runs, traced, estimate):
         import shutil
-        import subprocess
         import tempfile
 
         directory = tempfile.mkdtemp(prefix="replay", dir="/tmp")
         try:
             patched = []
-            for index, (path, text, _) in enumerate(traced):
+            for index, (path, text, _, _) in enumerate(traced):
                 if not path.startswith("sqlglot/"):
                     return False
                 name = os.path.join(directory, "%d.py" % index)
                 with open(name, "w", encoding="utf-8", newline="") as handle:
                     handle.write(text)
                 patched.append("%s=%s" % (path, name))
+            budget = os.path.join(directory, "budget.json")
+            with open(budget, "w") as handle:
+                json.dump({"limit": self.limit, "plan": self.seconds["plan"], "full": self.seconds["full"]}, handle)
             for seed, plan, full in runs:
                 # cheap ones first: a difference ends the run
                 plan = sorted(plan, key=lambda q: self.seconds["plan"][q])
                 full = sorted(full, key=lambda q: self.seconds["full"][q])
-                done = subprocess.run(
-                    [sys.executable, "-B", "-s", REPLAY_PROGRAM, "run", PINNED, REPLAY_BASELINE, seed,
-                     ",".join(str(q) for q in plan) or "-", ",".join(str(q) for q in full) or "-"] + patched,
-                    env={"PYTHONHASHSEED": seed, "HOME": "/tmp", "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
-                    cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    timeout=8 + 2.5 * estimate)
-                if done.returncode != 0 or done.stdout.strip() != b"same":
+                status, output = run_program(
+                    [REPLAY_PROGRAM, "run", PINNED, REPLAY_BASELINE, seed,
+                     ",".join(str(q) for q in plan) or "-", ",".join(str(q) for q in full) or "-", budget] + patched,
+                    {"PYTHONHASHSEED": seed, "HOME": "/tmp", "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
+                    directory, 5 + 1.5 * self.limit, capture=True)
+                if status != 0 or output.strip() != b"same":
                     return False
             return True
         finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- verify
+
+VERIFY_MAP = os.path.join(MAPS, "verify.json")
+VERIFY_PROGRAM = os.path.join(HERE, "verify.py")
+VERIFY_MARK = os.path.join(HERE, "tests-can-run")
+TREE = os.environ.get("BLAST_TREE", "/tmp/blast-tree")
+# Running candidates here is worth it when their CPU seconds are clearly fewer than what
+# handing them out costs: run when (estimated CPU) <= VERIFY_WORTH * (seconds saved if all pass).
+VERIFY_WORTH = float(os.environ.get("BLAST_VERIFY_WORTH", "0.5"))
+VERIFY_TOTAL_SECONDS = float(os.environ.get("BLAST_VERIFY_TOTAL", "50"))  # wall clock for one run
+
+
+class Tree:
+    """A copy of the pinned tree in which files can be replaced: real directories, a
+    symbolic link per file (and per bytecode directory), so making it costs a few
+    milliseconds and no space. A patched file becomes a real file there. Tests are run
+    from this directory, so processes they start see the patched files too."""
+
+    def __init__(self):
+        self.root = TREE
+        self.replaced = []
+        import shutil
+
+        shutil.rmtree(self.root, ignore_errors=True)
+        for directory, subdirectories, files in os.walk(PINNED):
+            target = os.path.join(self.root, os.path.relpath(directory, PINNED))
+            os.makedirs(target, exist_ok=True)
+            if "__pycache__" in subdirectories:
+                subdirectories.remove("__pycache__")
+                os.symlink(os.path.join(directory, "__pycache__"), os.path.join(target, "__pycache__"))
+            for name in files:
+                os.symlink(os.path.join(directory, name), os.path.join(target, name))
+
+    def replace(self, path, text):
+        name = os.path.join(self.root, path)
+        original = os.path.join(PINNED, path)
+        os.remove(name)
+        self.replaced.append(path)
+        with open(name, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        # never the modification time of the pinned file: its stored bytecode must not match
+        stamp = os.stat(original).st_mtime + 86400
+        os.utime(name, (stamp, stamp))
+
+    def restore(self):
+        for path in self.replaced:
+            name = os.path.join(self.root, path)
+            if os.path.lexists(name):
+                os.remove(name)
+            os.symlink(os.path.join(PINNED, path), name)
+        self.replaced = []
+
+
+class Verifier:
+    """Runs candidate tests on the patched tree (verify.py) and keeps only those that do
+    not pass. Only tests listed in maps/verify.json are ever run here: tests that pass in
+    this image at the pinned commit, alone and together with their file, with their CPU
+    seconds. Every other test stays selected as it is."""
+
+    def __init__(self, maps, test_ids, duration):
+        table = json.load(open(VERIFY_MAP))
+        self.start = table["start"]
+        self.ids = test_ids
+        # per test: CPU when it runs after others of its file, and what it costs more when
+        # it is the first (modules loaded on first use, worker processes started)
+        self.cpu = {n: table["tests"][tid] for n, tid in enumerate(test_ids) if tid in table["tests"]}
+        self.duration = duration
+        self.tree = None
+        self.spent = 0.0
+
+    def cost(self, numbers):
+        workers = split(numbers, self.duration)
+        return (max(sum(self.duration[n] for n in w) for w in workers) + WORKER_COST_MS * len(workers)) / 1000.0 if workers else 0.0
+
+    def narrow(self, numbers, patch_text, notes):
+        """Returns (tests still selected, tests that were run here and passed)."""
+        candidates = [n for n in numbers if n in self.cpu]
+        if not candidates:
+            return numbers, []
+        chosen = set(candidates)
+        rest = [n for n in numbers if n not in chosen]
+        first = {}
+        for n in candidates:
+            name = self.ids[n].split("::")[0]
+            first[name] = max(first.get(name, 0.0), self.cpu[n][1])
+        estimate = self.start + sum(self.cpu[n][0] for n in candidates) + sum(first.values())
+        saved = self.cost(numbers) - self.cost(rest)
+        if estimate > VERIFY_WORTH * saved or self.spent + estimate > VERIFY_TOTAL_SECONDS:
+            notes.append("%d candidates not run here (%.1f s, %.1f s to save)" % (len(candidates), estimate, saved))
+            return numbers, []
+        # the patched files: only plain modifications of text files we hold
+        files = []
+        code = False
+        for change in parse_patch(patch_text):
+            if change.mode_only:
+                continue
+            if change.status != "M" or change.binary or change.old != change.new:
+                return numbers, []
+            if not os.path.isfile(os.path.join(PINNED, change.old)):
+                return numbers, []
+            files.append((change.old, apply_hunks(read_pinned(change.old), change.hunks)[0]))
+            code = code or change.old.endswith(".py")
+        if not code:
+            return numbers, []  # a changed fixture: the tests that read it are expected to fail
+        plan = {"worth": VERIFY_WORTH, "all": self.cost(numbers), "rest": [self.duration[n] for n in rest],
+                "duration": {self.ids[n]: self.duration[n] for n in candidates},
+                "cpu": {self.ids[n]: self.cpu[n][0] for n in candidates}}
+        started = time.monotonic()
+        try:
+            outcome = self.run(candidates, files, estimate, plan)
+        except Exception as error:
+            outcome = None
+            notes.append("running candidates failed: %r" % (error,))
+        self.spent += time.monotonic() - started
+        if outcome is None:
+            return numbers, []
+        _, passed, ran = outcome
+        notes.append("ran %d of %d candidates here (%.1f s, expected %.1f s): %d pass" % (
+            len(ran), len(candidates), time.monotonic() - started, estimate, len(passed)))
+        return sorted(set(numbers) - set(passed)), passed
+
+    def run(self, candidates, files, estimate, plan):
+        """Returns (candidates that stay selected, candidates that ran and passed,
+        candidates that ran), or None when the run told us nothing."""
+        import tempfile
+
+        if self.tree is None:
+            self.tree = Tree()
+        directory = tempfile.mkdtemp(prefix="verify", dir="/tmp")
+        wanted, out = os.path.join(directory, "ids.txt"), os.path.join(directory, "result.json")
+        plan_file = os.path.join(directory, "plan.json")
+        try:
+            for path, text in files:
+                self.tree.replace(path, text)
+            with open(wanted, "w") as handle:
+                handle.write("\n".join(self.ids[n] for n in candidates) + "\n")
+            with open(plan_file, "w") as handle:
+                json.dump(plan, handle)
+            status, _ = run_program(
+                [VERIFY_PROGRAM, self.tree.root, wanted, out, plan_file],
+                {"SKIP_INTEGRATION": "0", "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp",
+                 "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                 # numpy's maths library would start a thread per CPU of the host
+                 "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+                self.tree.root, 10 + 4 * estimate)
+            if status != 0:
+                return None
+            result = json.load(open(out))
+            number_of = {self.ids[n]: n for n in candidates}
+            failed = {number_of[tid] for tid in result["not_passed"]}
+            ran = {number_of[tid] for tid in result["seconds"]}
+            # passed: it ran and is not listed as not passed. Everything else stays.
+            passed = [n for n in candidates if n in ran and n not in failed]
+            return set(candidates) - set(passed), passed, ran
+        except (OSError, ValueError, KeyError):
+            return None
+        finally:
+            self.tree.restore()
+            import shutil
+
             shutil.rmtree(directory, ignore_errors=True)
 
 
@@ -1841,6 +2044,13 @@ def main():
             replayer = Replayer(maps, duration)
     except Exception as error:  # without it the slow test is simply never dropped this way
         log("replay unavailable:", repr(error))
+    verifier = None
+    try:
+        # the two marker files tell that the image has the packages sqlglot and its tests import
+        if maps is not None and os.path.exists(REPLAY_BASELINE) and os.path.exists(VERIFY_MARK) and os.path.exists(VERIFY_MAP):
+            verifier = Verifier(maps, [t["id"] for t in tests], duration)
+    except Exception as error:
+        log("running candidates unavailable:", repr(error))
 
     for commit in commit_ids:
         workers = run_all
@@ -1859,11 +2069,17 @@ def main():
                 numbers = maps.numbers(bits)
                 if numbers and maps.unknown:
                     numbers = sorted(set(numbers) | set(maps.unknown))
+            passed = []
+            if verifier is not None and numbers and len(numbers) < len(everything):
+                try:
+                    numbers, passed = verifier.narrow(numbers, patch_text, notes)
+                except Exception as error:
+                    log(commit, "candidates not run:", repr(error))
             workers = split(numbers, duration) if len(numbers) < len(everything) else run_all
             added = 0
             if FILL and workers and len(numbers) < len(everything):
                 try:
-                    filled = fill(workers, [maps.numbers(group) for group in wider(patch_text, maps)], duration)
+                    filled = fill(workers, [passed] + [maps.numbers(group) for group in wider(patch_text, maps)], duration)
                     added = sum(len(w) for w in filled) - len(numbers)
                     workers = filled
                 except Exception as error:

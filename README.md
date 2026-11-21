@@ -11,7 +11,9 @@ syntax trees to find exactly which statements changed, and asks maps recorded at
 pinned commit which tests execute those statements, import that module or open that file.
 When it cannot reason about a change, it runs every test. For the slowest integration
 test it goes one step further: it repeats that test's sqlglot calls on the patched code
-(`replay.py`) and keeps the test unless the outcome is identical to the pinned one.
+(`replay.py`) and keeps the test unless the outcome is identical to the pinned one. And
+when the remaining candidates are cheap, it runs them on the patched code in the image
+(`verify.py`) and prints only the ones that do not pass.
 
 There is no table from patches, or from kinds of edit, to tests. The maps describe the
 pinned commit only: which test executes which line, imports which module, opens which
@@ -27,7 +29,8 @@ same whatever the patches are.
 | `selector.py`, `run.py` | The program the image runs. Standard library only. |
 | `replay.py` | Started by the selector for some commits: repeats the sqlglot calls of the slow executor test on the patched code and compares fingerprints of what they return. Runs the pinned sqlglot. |
 | `maps/` | Recordings of the pinned commit, as plain JSON (see `tools/build_maps.py`). |
-| `pinned.tar.xz` | Unmodified files of sqlglot at the pinned commit, packed to keep the repository small: its Python files and two config files (the selector needs their text to rebuild a patched file) and the TPC-DS fixture files (`tests/fixtures/optimizer/tpc-ds/`) that `replay.py` reads. The image unpacks it to `pinned/`; to work locally, `tar -xJf pinned.tar.xz`. |
+| `verify.py` | Started by the selector for some commits: runs candidate tests of the pinned suite with unittest on a patched copy of the tree. |
+| `pinned.tar.xz` | Unmodified files of sqlglot at the pinned commit, packed to keep the repository small: its Python files and two config files (the selector needs their text to rebuild a patched file) and the test fixtures except the TPC-H tables (`replay.py` and `verify.py` read them). The image unpacks it to `pinned/`; to work locally, `tar -xJf pinned.tar.xz`. |
 | `tools/` | How the maps were made, and the local evaluation harness. Not used at run time. |
 | `Dockerfile`, `Makefile`, `score.py`, `SCORING.md`, `sample/` | From the organisers' starter kit. |
 
@@ -49,12 +52,15 @@ make build                     # the entry image; the next step runs inside it
 docker run --rm --network none -v $PWD/tools:/tools:ro -v $PWD/rec:/out blast-radius-entry \
     python -B -s /tools/record_replay.py /app/pinned /out/replay.json
 python3 tools/build_replay_maps.py rec/phase rec/replay.json .
-make build                     # again, now with maps/replay.json
+docker run --rm --network none -v $PWD/tools:/tools:ro -v $PWD/rec:/out -v $PWD/sample/tests.json:/data/tests.json:ro \
+    blast-radius-entry python -B -s /tools/record_verify.py /app/pinned /data/tests.json /out/verify.json
+cp rec/verify.json maps/verify.json
+make build                     # again, now with maps/replay.json and maps/verify.json
 ```
 
 `build_maps.py` writes the pinned sources to `pinned/`; the tracked archive is made from it
 with `tar --sort=name --exclude=__pycache__ -cJf pinned.tar.xz pinned` (after copying
-`tests/fixtures/optimizer/tpc-ds/` from the checkout into `pinned/`).
+`tests/fixtures/` from the checkout into `pinned/`, without `optimizer/tpc-h/*.csv.gz`).
 
 The recordings run each test under the labelling image and package versions
 (`requirements.lock`), with a recorder loaded into every Python process the test starts.
@@ -70,12 +76,14 @@ python3 tools/evaluate.py sample sample/answers.json   # same without Docker, wi
 ## Open-source code used
 
 - **sqlglot** (MIT, © Toby Mao). `pinned.tar.xz` holds unmodified copies of its Python
-  source files, `pyproject.toml`, `setup.cfg` and the TPC-DS test fixtures at the pinned
-  commit, with its licence in `pinned/LICENSE`. The maps in `maps/` were recorded by running its test suite.
-- **python-dateutil** 4.0.0 (Apache 2.0 / BSD) and **mypy_extensions** 1.2.0 (MIT) are
-  installed into the image from PyPI. sqlglot imports them when they are present, as they
-  are where the tests run, and `replay.py` runs the pinned sqlglot. The selector itself
-  does not use them.
+  source files, `pyproject.toml`, `setup.cfg` and its test fixtures (without the TPC-H
+  tables) at the pinned commit, with its licence in `pinned/LICENSE`. The maps in `maps/` were recorded by running its test suite.
+- Installed into the image from PyPI, at the versions of `requirements.lock`:
+  **python-dateutil** 4.0.0 (Apache 2.0 / BSD) and **mypy_extensions** 1.2.0 (MIT), which
+  sqlglot imports when they are present, as they are where the tests run; and **pytz**
+  2026.6 (MIT), **tzdata** 2026.6 (Apache 2.0), **numpy** 2.5.5 (BSD), **pandas** 3.1.1
+  (BSD) and **duckdb** 2.0.0 (MIT), which sqlglot's test files import. `replay.py` and
+  `verify.py` run the pinned sqlglot and its tests; the selector itself uses none of them.
 - **coverage.py** (Apache 2.0, © Ned Batchelder and contributors) recorded the executed
   lines. It is used only by `tools/`, never in the image.
 - **pytest** (MIT) ran the tests while recording. Used only by `tools/`.
