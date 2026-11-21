@@ -1092,6 +1092,37 @@ def _module_names(path):
     return names
 
 
+def _inert_at_import(node, in_class=False):
+    """True for a statement of a new test module that, when the module is imported, only
+    defines things: imports, plain functions, plain test classes, constants."""
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return not in_class
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # decorators, default values and annotations run when the function is defined
+        arguments = node.args
+        return (
+            not node.decorator_list
+            and all(isinstance(d, ast.Constant) for d in arguments.defaults)
+            and all(d is None or isinstance(d, ast.Constant) for d in arguments.kw_defaults)
+            and not getattr(node, "type_params", None)
+        )
+    if isinstance(node, ast.ClassDef):
+        # a base class may run code for every subclass (a registry, a metaclass); the
+        # plain test bases do not
+        if in_class or node.decorator_list or node.keywords or getattr(node, "type_params", None):
+            return False
+        for base in node.bases:
+            name = base.id if isinstance(base, ast.Name) else base.attr if isinstance(base, ast.Attribute) else None
+            if name not in ("TestCase", "Validator", "object"):
+                return False
+        return all(_inert_at_import(child, True) for child in node.body)
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return isinstance(node.value, ast.Constant) or (isinstance(node, ast.AnnAssign) and node.value is None)
+    if isinstance(node, ast.Expr):
+        return isinstance(node.value, ast.Constant)
+    return isinstance(node, ast.Pass)
+
+
 def select_added(change, maps, notes):
     path = change.new
     name = path.rsplit("/", 1)[-1]
@@ -1120,15 +1151,8 @@ def select_added(change, maps, notes):
             tree = ast.parse(text)
         except (SyntaxError, ValueError):
             tree = None
-        if tree is not None:
-            for node in tree.body:
-                if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef)):
-                    continue
-                if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Constant):
-                    continue
-                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-                    continue
-                raise RunEverything("new test module with top-level code")
+        if tree is not None and not all(_inert_at_import(node) for node in tree.body):
+            raise RunEverything("new test module with top-level code")
     notes.append("new file %s" % path)
     return bits
 

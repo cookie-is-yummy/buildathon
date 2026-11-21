@@ -20,6 +20,7 @@ this repository**, and the selector reads none.
 | --- | --- |
 | `evaluate.py` | Runs the selector on a data directory and scores it with the kit's `score.py`, per kind. |
 | `gen_patches.py` | Generates synthetic patches of many kinds against a pinned checkout. |
+| `gen_special.py` | Hand-written patches of kinds the random generator does not make (test methods added or removed, shared helpers, new directories, binary fixtures, renames, file modes). |
 | `gt_loop.sh`, `gt_plugin.py`, `gt_answers.py` | Ground truth: runs the full sqlglot suite on each synthetic patch. |
 | `fast_gt.py`, `fast_eval.py` | Faster ground truth for modules few tests import: only the importers are run. |
 | `difftest.py` | Checks that parsing only the touched statement gives the same analysis as parsing the whole file. |
