@@ -14,8 +14,9 @@ When it cannot reason about a change, it runs every test.
 There is no table from patches, or from kinds of edit, to tests. The maps describe the
 pinned commit only: which test executes which line, imports which module, opens which
 file, reads which class attribute, and what it observed when it evaluated a comparison
-(how the two operands related). They were recorded by running the unmodified test suite
-and are the same whatever the patches are.
+(how the two operands related) or an `and`/`or` expression (which operands it reached and
+which were true). They were recorded by running the unmodified test suite and are the
+same whatever the patches are.
 
 ## Layout
 
@@ -41,9 +42,6 @@ python3 tools/build_maps.py sqlglot sample/tests.json . rec/iso2 rec/seq/forward
 python3 tools/build_attr_maps.py sqlglot sample/tests.json . rec/attrs
 python3 tools/build_cmp_maps.py sample/tests.json . rec/cmp rec2/cmp
 ```
-
-`build_cmp_maps.py` also writes `maps/bool/` (what each test observed at every `and`/`or`).
-This version does not ship that directory; see NOTES.md.
 
 The recordings run each test under the labelling image and package versions
 (`requirements.lock`), with a recorder loaded into every Python process the test starts.

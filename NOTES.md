@@ -24,7 +24,9 @@ before the competition we recorded, at the pinned commit, what every test uses:
 - which modules it **tries to import and does not find**,
 - which **class attributes** it reads,
 - for every **comparison** it evaluates, how the two operands relate (same object,
-  equal, less).
+  equal, less),
+- for every **`and`/`or` expression** it evaluates, which operands were reached and
+  which of them were true.
 
 These recordings ("maps") depend only on the pinned commit. They are the same whatever
 patches arrive. At run time the selector works out *what a patch changes* and looks up
@@ -207,14 +209,55 @@ On the sample this moves three commits from "run the 21 s test" to "run nothing"
 (`is` -> `==` on an enum member, `is None` -> `== None`, `<` -> `<=`): the tests execute
 the line, the operands never distinguish the two operators, and indeed nothing fails.
 
-### `and` / `or` (written, switched off)
+### `and` / `or`
 
-`selector.py` also contains two rules that use a recording of every `and`/`or`
-expression (which operands a test evaluated, and which were true): one for a patch that
-swaps `and` and `or`, one for a patch confined to a later operand of such an expression.
-Both do nothing unless `maps/bool/` exists, and it is **not shipped** in this version:
-their checks (below) had not finished. Without that directory the selector treats such
-patches like any other changed statement.
+The same idea, for short-circuit expressions. Python evaluates `a and b` left to right
+and stops as soon as the answer is known, so many tests that execute the line never look
+at `b`. The comparison recording also notes, for every `and`/`or` expression (nested
+ones are flattened into one list of operands) and every test, each distinct **outcome**:
+which operands were evaluated and which of those were true. Again a fact about the
+pinned commit only.
+
+Two rules use it. Both start from the tests that execute the statement and only remove
+tests that were *seen* evaluating the expression; a test that executes the statement but
+was never seen evaluating the expression stays selected, and so does everyone when the
+map does not know the expression.
+
+1. **`and` swapped with `or`** (operands untouched). For each outcome a test produced,
+   the selector replays the new expression on the recorded operand values. The test is
+   removed only if, for every one of its outcomes:
+   - the new expression needs no operand the old one did not evaluate (we do not know
+     that operand's value, so we cannot say what would happen);
+   - the result is the same: the same operand's value, or, where only the truth of the
+     expression is used (an `if`, `while`, `not`, a condition), the same truth;
+   - every operand the new expression no longer evaluates is free of side effects. That
+     is judged from the source, strictly: names, constants, attribute reads, constant
+     subscripts, comparisons, arithmetic, eight built-ins (`isinstance`, `issubclass`,
+     `len`, `getattr`, `hasattr`, `type`, `callable`, `id`) and methods only strings
+     have. An attribute whose name is that of a decorated function (a property, say)
+     anywhere in sqlglot with a body that does more than return such an expression
+     counts as having side effects (`maps/bool/_properties.json` lists them: 192 of 206
+     names). Any other call, any comprehension or generator expression (walking an
+     iterator uses it up), `any`/`all`, `str()` and f-strings: the test stays.
+   On most swaps this removes few tests, because a swap usually does change the result.
+2. **A change confined to a later operand** (`a and b` where only `b` differs; any
+   operand but the first). A test that never reached that operand cannot notice. Tests
+   that did reach it stay. Not applied when the old or new operand contains `:=`,
+   `yield` or `await`, which change the function around them just by being there.
+
+An evaluation that did not finish (an exception inside an operand, a generator that was
+left suspended) is recorded as "abandoned" and keeps the test selected under both rules.
+
+To record truth the recorder asks `bool()` of every operand, including the last one,
+which Python itself does not ask. That runs `__bool__`/`__len__`; sqlglot has four such
+methods and each only returns a stored value. An operand whose truth cannot be asked
+(it raises) makes the evaluation "abandoned".
+
+No sample commit benefits from these two rules. The sample has three `and`/`or` swaps;
+the tests that execute them nearly all fail (8 of 10, 37 of 37, 10 of 10) and all stay
+selected. The value is on other patches of these kinds: over every possible one in
+sqlglot the rules cut the cost by roughly 3% (`and` -> `or`), 15% (`or` -> `and`) and
+25-40% (later operand).
 
 ### Tests that inspect code instead of running it
 
@@ -359,10 +402,13 @@ Listed from most to least worrying.
 
 | + comparison-operator rule (maps of observed operand outcomes) | 117.425 | 0 | 0.12 | all five sets below: 0 misses; plus the left-out-tests check below |
 
+| + `and`/`or` swap rule and later-operand rule | 117.425 | 0 | 0.10 | all five sets: 0 misses (mixed set 1531.1 s -> 1504.8 s); left-out-tests checks below |
+
 By kind on the sample at the last step: code 89.3 s (16 commits; the best possible is
 79.1 s), comment 0.0 s (3), fixture 17.9 s (8; best possible 17.9), multi 10.2 s (3; best
 possible 10.2). "Best possible" means selecting exactly the failing tests. Before the
-comparison rule the code commits cost 142.1 s.
+comparison rule the code commits cost 142.1 s. The `and`/`or` rules change nothing on
+the sample.
 
 ### Local evaluation sets (never shipped, never read by the selector)
 
@@ -392,3 +438,40 @@ For those two, every test the selector had left out was run separately under the
 
 The ground-truth method was checked against the organisers' answers: running the full
 suite on three sample patches reproduced their failing sets exactly.
+
+### The left-out-tests check (for the comparison and `and`/`or` rules)
+
+The sets above mostly tell us about patches that make tests fail. These rules are about
+tests we *leave out*, so they get a direct check: `tools/gen_swaps.py` draws random
+single-edit patches of the kind a rule handles from the **whole** of sqlglot (not from
+the sample), keeps those where the rule leaves out at least one test that executes the
+statement, and `tools/swap_gt.py` runs exactly those left-out tests on the patched tree.
+Every one of them must pass. A single failure means the rule or the recording is wrong.
+
+| Rule | Patches | Left-out tests run | Failed |
+| --- | --- | --- | --- |
+| Comparison operator swapped (all 46 pairs of operators that occur) | 400 | 31,173 | 0 |
+| `and` <-> `or` (200 each way) | 400 | 39,876 | 0 |
+| Later operand: the operand replaced by an expression that raises as soon as it is evaluated | 400 | 51,721 | 0 |
+
+For the later-operand rule the replacement is the harshest possible change: any left-out
+test that evaluates the operand even once crashes.
+
+History, so the numbers are not read as more than they are. The comparison check was
+run with the first recording. After the recorder was rewritten (see "Mistakes"), the
+same 400 patches were looked at again with the new maps: on 392 the same tests are left
+out, on 6 fewer, and on 2 one more test each; those two were run and pass. The `and`/`or`
+check that caught the mistake was thrown away and both `and`/`or` checks were generated
+and run afresh on the new maps. Merging the second recording pass changed what is left
+out on one of the 800 patches (fewer tests). Later the side-effect judgement was made
+stricter (comprehensions, `any`/`all`, `str()` no longer count as harmless); that leaves
+out fewer tests on 12 of the 400 `and`/`or` patches and no additional test anywhere, so
+the results above still cover everything the shipped rules leave out.
+
+What this does and does not show: with 0 failures in 400 patches per rule, a rule that
+went wrong on more than about 1 patch in 130 would very likely have been caught. It does
+not prove zero. One miss costs 300 s. A narrowed patch saves on average about 2 s
+(`and` -> `or`), 6 s (`or` -> `and`) or 5 s (later operand), so these rules pay only if
+they go wrong on fewer than about 1 narrowed patch in 50 to 150. The check supports
+that, without much to spare. The comparison rule saves more per narrowed patch (about
+12 s for `is not` -> `!=`, the one swap measured this way), so its margin is wider.

@@ -1209,10 +1209,11 @@ def read_pinned(path):
 
 
 # Calls that cannot change anything: these builtins, `<x>.args.get(...)` (the argument
-# dictionary of an expression) and methods that only strings have.
+# dictionary of an expression) and methods that only strings have. Not here on purpose:
+# `any`/`all` (they use up an iterator), `str`/`repr`/`int`/... (they run the object's own
+# conversion method).
 _PURE_BUILTINS = frozenset((
-    "isinstance", "issubclass", "len", "getattr", "hasattr", "type", "callable", "bool", "str", "int",
-    "float", "any", "all", "abs", "repr", "id",
+    "isinstance", "issubclass", "len", "getattr", "hasattr", "type", "callable", "id",
 ))
 _PURE_METHODS = frozenset((
     "startswith", "endswith", "upper", "lower", "strip", "lstrip", "rstrip", "isdigit", "isalpha",
@@ -1256,13 +1257,11 @@ def _pure(node, impure_names):
             return False
         return all(_pure(arg, impure_names) for arg in node.args) and all(
             _pure(keyword.value, impure_names) for keyword in node.keywords)
+    # Comprehensions and generator expressions are left out: walking an iterator uses it up.
     if isinstance(node, (ast.Compare, ast.UnaryOp, ast.BinOp, ast.BoolOp, ast.IfExp, ast.Tuple, ast.List,
-                         ast.Set, ast.Dict, ast.JoinedStr, ast.FormattedValue, ast.Starred, ast.Slice,
-                         ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp, ast.comprehension)):
-        if isinstance(node, ast.comprehension) and node.is_async:
-            return False
+                         ast.Set, ast.Dict, ast.Starred, ast.Slice)):
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.expr, ast.comprehension)) and not _pure(child, impure_names):
+            if isinstance(child, ast.expr) and not _pure(child, impure_names):
                 return False
         return True
     return False
