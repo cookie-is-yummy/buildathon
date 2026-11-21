@@ -198,9 +198,11 @@ file are selected. If it no longer parses or gains pytest settings: run everythi
 - **New**: tests whose code lists that directory or one above it, and tests that tried to
   import a module of that name and did not find it (sqlglot tries `sqlglot._version` and
   `sqlglotrs`, for example). A new `conftest.py`, `pytest.ini`, `tox.ini`, `__init__.py`,
-  `.pth`, any new top-level Python or config file, or a new top-level directory: run
-  everything, because the repository root is on the import path and such files can change
-  pytest or shadow a module. A new test module selects nothing unless its top level does
+  `.pth`, or any new top-level Python or config file: run everything, because the
+  repository root is on the import path and such files can change pytest or shadow a
+  module (in our test set a new top-level `json.py` broke all 1620 tests). A new
+  directory can only become a "namespace package", which never shadows a real module, so
+  it matters only to tests that tried to import that name. A new test module selects nothing unless its top level does
   more than import and define things.
 - **Renamed**: a deletion plus an addition.
 
@@ -279,9 +281,10 @@ real tests are then run on each patch to learn which fail.
 
 | Set | How ground truth was obtained | Patches | With failures | Misses |
 | --- | --- | --- | --- | --- |
-| Mixed kinds | full suite (`tools/gt_loop.sh`) | 36 of 155 so far | 22 | 0 |
+| Mixed kinds | full suite (`tools/gt_loop.sh`) | 59 of 155 so far | 40 | 0 |
 | Class-attribute and lambda rules | full suite | 26 | 19 | 0 |
 | Dialect-specific modules | only the tests that import the patched module (`tools/fast_gt.py`): no other test can be affected | 287 | 191 | 0 |
+| Dialect, executor and optimizer modules, and test files | importers only | 182 | 139 | 0 |
 
 In the third set the selector chose 25,242 tests in total where "every importer" would be
 94,215. One patch there turned a loop infinite and exhausted memory, killing the test

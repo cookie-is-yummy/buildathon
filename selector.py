@@ -1102,11 +1102,16 @@ def select_added(change, maps, notes):
             # The repository root is on the import path: a new top-level module can shadow
             # any import, and a new config file can reconfigure pytest.
             raise RunEverything("new top-level file %s" % name)
-    elif path.split("/", 1)[0] not in maps.tracked_dirs:
-        raise RunEverything("new top-level directory")
     bits = _listers_above(path, maps)
     for module in _module_names(path):
         bits |= maps.tried_importing(module)
+    # A directory that did not exist before becomes importable as a namespace package
+    # (it cannot shadow a real package or module, which always win over namespace ones).
+    # That matters only to code that tried to import that name and did not find it.
+    directory = _directory(path)
+    while directory and directory not in maps.tracked_dirs:
+        bits |= maps.tried_importing(directory.replace("/", "."))
+        directory = _directory(directory)
     if path.endswith(".py") and path.startswith("tests/"):
         # pytest may collect it. A new test module cannot fail an existing test unless it
         # does something at import time, so look at what its top level does.
