@@ -35,6 +35,10 @@ def files(prefix, suffix):
 
 
 SRC = [f for f in files("sqlglot", ".py")]
+if os.environ.get("FILE_RE"):
+    import re as _re
+
+    SRC = [f for f in SRC if _re.search(os.environ["FILE_RE"], f)]
 TESTS = [f for f in files("tests", ".py")]
 FIXTURES = [f for f in git("ls-files", "tests/fixtures").split("\n") if f]
 

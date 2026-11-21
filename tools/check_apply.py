@@ -35,7 +35,7 @@ for p in sorted(glob.glob(sys.argv[1] + "/*.patch")):
                 try: ast.parse(real); parses = True
                 except SyntaxError: parses = False
                 same = parses and ast.dump(ast.parse(old)) == ast.dump(ast.parse(real))
-                empty = d is not None and not (d.whole_module or d.statements or d.functions or d.lambdas)
+                empty = d is not None and not (d.whole_module or d.statements or d.functions or d.lambdas or d.attributes or d.docstrings)
                 if (d is None) != (not parses and True) and parses: print("COMPILE-ONLY failure", p)
                 if d is not None and empty != same: print("DIFF DISAGREES", p, "empty", empty, "same", same)
 subprocess.run(["git", "-C", repo, "reset", "-q", "--hard", "HEAD"]); subprocess.run(["git", "-C", repo, "clean", "-fdq"])

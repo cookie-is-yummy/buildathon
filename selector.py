@@ -223,11 +223,17 @@ def parse_patch(text):
                 current.old = current.new = rest[:half][2:]
             i += 1
             continue
+        if line.startswith("--- ") and (current is None or current.hunks or current.binary):
+            # a plain `diff -u` section without a "diff --git" line
+            current = FileChange()
+            changes.append(current)
         if current is None:
-            if line.strip() == "" or not line.startswith(("---", "+++", "@@")):
+            if line.strip() == "" or not line.startswith(("+++", "@@")):
                 i += 1  # leading commit message or mail headers
                 continue
             raise RunEverything("hunk before any file header")
+        if line == "-- " and (current.hunks or current.binary):
+            break  # the signature that `git format-patch` appends
         if line.startswith("@@"):
             try:
                 header = line.split("@@")[1].strip().split(" ")
@@ -299,6 +305,12 @@ def parse_patch(text):
         i += 1
     if not changes:
         raise RunEverything("no file changes found")
+    seen_paths = set()
+    for change in changes:
+        for path in {change.old, change.new} - {None}:
+            if path in seen_paths:
+                raise RunEverything("a file appears twice in the patch")
+            seen_paths.add(path)
     for change in changes:
         if change.status == "A":
             change.old = None
@@ -1070,8 +1082,9 @@ def select_change(change, maps, notes):
     if change.status == "D":
         return select_removed(change.old, maps, notes)
     if change.status == "R":
-        if change.hunks or change.binary:
-            raise RunEverything("rename with content change")
+        if (change.hunks or change.binary) and change.new.startswith("tests/") and change.new.endswith(".py"):
+            # we only see the changed lines, not the whole new test module
+            raise RunEverything("renamed test module with content change")
         if change.new in maps.tracked:
             raise RunEverything("rename onto an existing file")
         return select_removed(change.old, maps, notes) | select_added(change, maps, notes)
