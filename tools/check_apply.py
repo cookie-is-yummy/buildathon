@@ -1,10 +1,10 @@
 """Check the selector's patch parser/applier against `git apply` on a set of patches."""
 import os, subprocess, sys, glob
-sys.path.insert(0, "/home/user/Digestr/blast-radius")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import selector as S
-repo = "/home/user/br-work/sqlglot_chk"
+repo = os.environ.get("BR_WORK", "/home/user/br-work") + "/sqlglot_chk"
 if not os.path.isdir(repo):
-    subprocess.run(["cp", "-r", "/home/user/br-work/sqlglot", repo], check=True)
+    subprocess.run(["cp", "-r", os.environ.get("BR_WORK", "/home/user/br-work") + "/sqlglot", repo], check=True)
 ok = bad = 0
 import collections
 kinds = collections.Counter()
@@ -21,7 +21,7 @@ for p in sorted(glob.glob(sys.argv[1] + "/*.patch")):
     for c in changes:
         kinds[c.status + ("b" if c.binary else "")] += 1
         if c.status == "M" and not c.binary and c.hunks:
-            old = open(os.path.join("/home/user/br-work/sqlglot", c.old), encoding="utf-8", newline="").read()
+            old = open(os.path.join(os.environ.get("BR_WORK", "/home/user/br-work"), "sqlglot", c.old), encoding="utf-8", newline="").read()
             try:
                 new, ob, nb = S.apply_hunks(old, c.hunks)
             except S.RunEverything as e:

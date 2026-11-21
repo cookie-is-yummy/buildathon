@@ -1,8 +1,8 @@
 """Differential test: chunked parsing must give the same Diff as whole-file parsing."""
 import glob, json, os, sys
-sys.path.insert(0, "/home/user/Digestr/blast-radius")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import selector as S
-index = json.load(open("/home/user/Digestr/blast-radius/maps/index.json"))
+index = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "index.json")))
 def key(d):
     if d is None: return None
     return (d.whole_module, sorted(d.statements), sorted(d.functions), sorted(d.lambdas),

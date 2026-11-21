@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: gt_loop.sh <syn dir>   (host side) -- ground truth for every patch lacking a result
-W=/home/user/br-work; SYN=$1; mkdir -p $SYN/gt
+W=${BR_WORK:-/home/user/br-work}; SYN=$1; mkdir -p $SYN/gt
 G=${GT_REPO:-sqlglot_gt}; [ -d $W/$G ] || cp -r $W/sqlglot $W/$G
 for p in $SYN/commits/*.patch; do
   id=$(basename $p .patch); [ -f $SYN/gt/$id.json ] && continue

@@ -4,7 +4,7 @@ syn = sys.argv[1]
 meta = json.load(open(syn + "/meta.json"))
 tests = json.load(open(syn + "/tests.json"))["tests"]
 dur = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
-r = subprocess.run([sys.executable, "/home/user/Digestr/blast-radius/selector.py"], capture_output=True, env=dict(os.environ, BLAST_DATA=syn))
+r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "selector.py")], capture_output=True, env=dict(os.environ, BLAST_DATA=syn))
 log = {l.split(" ", 1)[0]: l.split(" ", 1)[1] for l in r.stderr.decode().split("\n") if " " in l}
 sel = {}
 for line in r.stdout.decode().split("\n"):
