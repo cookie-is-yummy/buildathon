@@ -257,9 +257,30 @@ Listed from most to least worrying.
 | + class-attribute reader maps | 178.749 | 0 | 0.16 (in Docker) | 7 of 155 ground truths so far: 0 misses |
 | + dialect classes instrumented before their metaclass runs | 170.202 | 0 | 0.11 | 20 of 155 ground truths: 0 misses |
 
+| + statement-level handling of added/removed statements, package-inspection rule, parser hardening | 170.202 | 0 | 0.12 (in Docker) | see below |
+
 By kind on the sample at the last step: code 142.1 s (16 commits; the best possible is
 79.1 s), comment 0.0 s (3), fixture 17.9 s (8; best possible 17.9), multi 10.2 s (3; best
 possible 10.2). "Best possible" means selecting exactly the failing tests.
+
+### Local evaluation sets (never shipped, never read by the selector)
+
+Synthetic patches are generated against the pinned checkout by `tools/gen_patches.py`
+(operator and constant flips in function bodies and at class/module level, removed table
+entries, removed or dedented statements, shadowing assignments, renamed functions, changed
+defaults, removed decorators and imports, syntax errors, comments, docstrings, whitespace,
+fixture edits, test edits, deleted/renamed/new files, config files, multi-file mixes). The
+real tests are then run on each patch to learn which fail.
+
+| Set | How ground truth was obtained | Patches | With failures | Misses |
+| --- | --- | --- | --- | --- |
+| Mixed kinds | full suite (`tools/gt_loop.sh`) | 36 of 155 so far | 22 | 0 |
+| Class-attribute and lambda rules | full suite | 26 | 19 | 0 |
+| Dialect-specific modules | only the tests that import the patched module (`tools/fast_gt.py`): no other test can be affected | 287 | 191 | 0 |
+
+In the third set the selector chose 25,242 tests in total where "every importer" would be
+94,215. One patch there turned a loop infinite and exhausted memory, killing the test
+process; the 133 importers we did not select were then run separately and all passed.
 
 The ground-truth method was checked against the organisers' answers: running the full
 suite on three sample patches reproduced their failing sets exactly.
