@@ -21,7 +21,12 @@ before the competition we recorded, at the pinned commit, what every test uses:
 - which **functions, lambdas and class bodies** it starts running,
 - which modules it **imports**,
 - which files it **opens** and which directories it **lists**,
-- which modules it **tries to import and does not find**.
+- which modules it **tries to import and does not find**,
+- which **class attributes** it reads,
+- for every **comparison** it evaluates, how the two operands relate (same object,
+  equal, less),
+- for every **`and`/`or`** it evaluates, which operands were evaluated and which were
+  true.
 
 These recordings ("maps") depend only on the pinned commit. They are the same whatever
 patches arrive. At run time the selector works out *what a patch changes* and looks up
@@ -142,6 +147,77 @@ import**: a constant replaced by a constant of the same type inside a literal, o
 creation hook reads the attribute) entries removed from a literal. Anything else, for
 example a changed argument of a call such as `re.compile(...)`, could raise while the
 module is imported and fail every importer, so it falls back to all importers.
+
+### Comparison operators (`is` / `==` / `!=` / `<` / `<=` ...)
+
+Executing a changed line is necessary for a test to fail, but far from sufficient. Take
+`if x is None:` rewritten as `if x == None:`. A test notices only if, at some moment while
+it runs, the two operators give **different answers for the two values actually being
+compared**. If they never do, the test's run is step for step the same as before, so it
+cannot change its result.
+
+What the operands look like is a fact about the pinned commit, and can be recorded before
+any patch exists. A third recording rewrites every two-operand comparison in sqlglot,
+while the module is being imported, into a call that returns exactly what the comparison
+returns and also notes **how the two operands relate**: are they the same object, are
+they equal, is one less than the other. Per test and per comparison the map keeps the set
+of distinct outcomes seen (usually one or two). It says nothing about patches.
+
+When a patch changes nothing but the operator of comparisons, the selector takes the tests
+that execute the statement (the line map, as before) and removes those for which, in
+**every** recorded outcome, the old and the new operator give the same answer. Everything
+else stays: tests where some outcome differs, tests that execute the statement without
+having been seen evaluating the comparison, and any comparison the map does not know.
+
+Details that keep this honest:
+
+- Unknown counts as different. If the recorder could not ask an operator (see next
+  point), or asking raised, or the comparison did not return `True`/`False`, the test
+  stays selected.
+- Asking `==` of arbitrary objects runs their `__eq__`. So for operands that are not plain
+  built-in values the recorder asks only the *closest* operator (`is` with `==`, `==`
+  with `!=`, `<` with `<=`, `>` with `>=`) and identity, which runs no code. A swap to a
+  far operator (say `==` to `<` on expression objects) is therefore never narrowed.
+- A swap **to** `is`/`is not` next to a literal makes Python print a `SyntaxWarning` when
+  the module is compiled. We cannot rule out that a test treats warnings as errors, so
+  that case is not narrowed.
+- Chained comparisons (`a < b < c`) are not recorded and not narrowed.
+- The map is the union of independent runs: every test alone in a fresh process (child
+  processes included), plus the whole suite in normal and in reversed order, all of that
+  done more than once (Python randomises string hashing per process, which can change the
+  order in which a set is walked). A test whose own run failed under the recorder is
+  never narrowed.
+- The recording was made with the same Python version as the image, so the positions
+  (line, column) of comparisons in the syntax tree match what the selector computes.
+
+On the sample this moves three commits from "run the 21 s test" to "run nothing"
+(`is` -> `==` on an enum member, `is None` -> `== None`, `<` -> `<=`): the tests execute
+the line, the operands never distinguish the two operators, and indeed nothing fails.
+
+### `and` / `or`
+
+The same idea. `if a and b:` rewritten as `if a or b:` behaves identically in a test for
+which `a` and `b` were both true every time. The recording notes, for every and/or
+expression and every test, the distinct outcomes: which operands were evaluated (the
+later ones are skipped when the result is already decided) and which of those were true.
+An evaluation that did not finish (an operand raised) is noted as such.
+
+For a patch that only regroups the same operands with different `and`/`or`, the selector
+replays each recorded outcome through the old and the new expression. A test stays
+unaffected only if for every outcome:
+
+- the new expression needs **no operand that was not evaluated** (we do not know its
+  value, and evaluating it might do anything);
+- the result is the same: the same operand's value, or, where the expression is only
+  tested for truth (`if`, `while`, `not`, a conditional expression, a comprehension
+  filter), the same truth value;
+- every operand the new expression **no longer evaluates is free of side effects**. This
+  is decided from the code, strictly: names, constants, attribute reads, constant
+  indexing, comparisons, `not`, `isinstance`/`len`/`getattr`-like builtins, string
+  predicates and `<expression>.args.get(...)`. Any other call (`self._match(...)`
+  advances the parser) is assumed to change state, and so is reading an attribute whose
+  name is a property anywhere in sqlglot unless that property just returns such an
+  expression (`maps/bool/_properties.json`, built from the pinned source).
 
 ### Tests that inspect code instead of running it
 

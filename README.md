@@ -13,8 +13,9 @@ When it cannot reason about a change, it runs every test.
 
 There is no table from patches, or from kinds of edit, to tests. The maps describe the
 pinned commit only: which test executes which line, imports which module, opens which
-file. They were recorded before any patch was looked at and are the same whatever the
-patches are.
+file, reads which class attribute, and what it observed when it evaluated a comparison
+or an `and`/`or` (how the operands related, which were true). They were recorded by
+running the unmodified test suite and are the same whatever the patches are.
 
 ## Layout
 
@@ -35,8 +36,10 @@ RUN="docker run --rm --network none -v $PWD/sqlglot:/src:ro -v $PWD/tools:/tools
 $RUN /tools/record_all.sh      # every test alone: lines, started functions, files
 $RUN /tools/record_suite.sh    # whole suite in one process, normal and reversed order
 $RUN /tools/record_attrs.sh    # every test alone: class attributes read
+$RUN /tools/record_cmp.sh      # comparisons and and/or: what each test observed (run it twice, into rec/ and rec2/)
 python3 tools/build_maps.py sqlglot sample/tests.json . rec/iso2 rec/seq/forward.json rec/seq/reverse.json
 python3 tools/build_attr_maps.py sqlglot sample/tests.json . rec/attrs
+python3 tools/build_cmp_maps.py sample/tests.json . rec/cmp rec2/cmp
 ```
 
 The recordings run each test under the labelling image and package versions

@@ -12,7 +12,8 @@ this repository**, and the selector reads none.
 | `site/sitecustomize.py`, `record_all.sh` | Recorder loaded into every Python process a test starts: executed lines, started functions, imported/opened/listed files. One fresh process tree per test. |
 | `site_seq/`, `record_suite.sh` | The whole suite in one process (normal and reversed order) with one coverage context per test. |
 | `site_attrs/sitecustomize.py`, `record_attrs.sh` | Which tests read which class attribute. |
-| `build_maps.py`, `build_attr_maps.py` | Turn the recordings into `maps/` and copy the pinned sources into `pinned/`. |
+| `site_cmp/`, `record_cmp.sh` | What each test observes when it evaluates a comparison (how the operands relate) or an `and`/`or` (which operands were evaluated and true). Every test alone, plus the whole suite in both orders. |
+| `build_maps.py`, `build_attr_maps.py`, `build_cmp_maps.py` | Turn the recordings into `maps/` and copy the pinned sources into `pinned/`. |
 
 ## Checking the selector
 
@@ -23,6 +24,7 @@ this repository**, and the selector reads none.
 | `gen_special.py` | Hand-written patches of kinds the random generator does not make (test methods added or removed, shared helpers, new directories, binary fixtures, renames, file modes). |
 | `gt_loop.sh`, `gt_plugin.py`, `gt_answers.py` | Ground truth: runs the full sqlglot suite on each synthetic patch. |
 | `fast_gt.py`, `fast_eval.py` | Faster ground truth for modules few tests import: only the importers are run. |
+| `gen_swaps.py`, `swap_gt.py` | For the comparison and `and`/`or` rules: makes single-operator patches, and runs exactly the tests the rule leaves out on each patched tree. Every one must pass. |
 | `difftest.py` | Checks that parsing only the touched statement gives the same analysis as parsing the whole file. |
 | `check_apply.py` | Checks the selector's patch applier against `git apply`. |
 

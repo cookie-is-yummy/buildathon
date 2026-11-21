@@ -3,12 +3,16 @@
 Every comparison `a OP b` in the repository's Python files (OP one of
 is, is not, ==, !=, <, <=, >, >=; chained comparisons are left alone) is rewritten, when
 the file is imported, into a call that returns exactly what the comparison returns and
-also notes, for each OTHER operator of that list, whether it would have returned something
-different for these two operands. From that we learn, for every comparison and every test:
-  - did the test evaluate this comparison at all, and
-  - for which replacement operators the outcome differed at least once.
-A test that evaluated a comparison and never saw a difference for operator X behaves
-identically if the comparison is rewritten to use X.
+also notes how the two operands relate: the answer each operator of that list gives for
+them (where it can be asked without running arbitrary code). Per test and comparison we
+keep the set of distinct outcomes. So we learn, for every comparison and every test,
+whether the test evaluated it and what the operands looked like each time.
+
+Every `and`/`or` expression is recorded too. For the whole expression (nested `and`/`or`
+flattened; its operands that are not themselves `and`/`or` are its "leaves", numbered left
+to right) we note each distinct outcome a test produced: which leaves were evaluated and
+which of those were true. An evaluation that did not finish (an exception, a generator
+that was suspended in the middle) is noted as "abandoned".
 
 Two modes:
   BR_CMP=<prefix>      one test per process tree: writes <prefix>.<pid>.json at exit
@@ -35,63 +39,125 @@ if _OUT or _SEQ:
     _FUNCS = (operator.is_, operator.is_not, operator.eq, operator.ne, operator.lt, operator.le, operator.gt, operator.ge)
     _N = len(_OPS)
     # values whose comparison methods are known to be free of side effects: for these
-    # every alternative operator is evaluated; for anything else only identity tests and
-    # the nearest alternative are (the others are then counted as "differs")
+    # every operator is asked; for anything else only identity and the nearest operator
+    # (the answers of the others stay unknown)
     _PLAIN = (int, float, str, bytes, bool, type(None), tuple, frozenset)
     _NEAR = {0: (2,), 1: (3,), 2: (0, 3), 3: (1, 2), 4: (5,), 5: (4,), 6: (7,), 7: (6,)}
 
     _sites = []      # index -> (file, line, column, operator index)
     _context = [0]   # bumped when the current test changes (suite mode)
-    _state = []      # index -> [context stamp, alternatives still agreeing]
-    _executed = {}   # context key -> set of site indexes
-    _differs = {}    # context key -> set of (site index, alternative)
+    _state = []      # index -> [context stamp, outcomes already noted in this context]
+    _outcomes = {}   # context key -> set of (site index, outcome)
     _key = [None if _SEQ else "process"]
 
     def _compare(a, b, index):
-        state = _state[index]
+        """Return `a OP b` and note the outcome: for each of the eight operators whether
+        its answer for these operands is known, and whether it is True. Encoded as
+        (known mask << 8) | true mask; 0 means nothing is known (the comparison raised or
+        did not return True/False)."""
         op = _sites[index][3]
-        if state[0] != _context[0]:
-            state[0] = _context[0]
-            state[1] = [alt for alt in range(_N) if alt != op]
-            key = _key[0]
-            if key is not None:
-                _executed.setdefault(key, set()).add(index)
         try:
             result = _FUNCS[op](a, b)
         except BaseException:
-            _all_differ(index, state)
+            _note(index, 0)
             raise
-        remaining = state[1]
-        if remaining:
+        known = true = 0
+        if result is True or result is False:
             plain = type(a) in _PLAIN and type(b) in _PLAIN
             near = _NEAR[op]
-            keep = []
-            for alt in remaining:
-                if alt < 2 or plain or alt in near:
+            for alt in range(_N):
+                if alt == op:
+                    other = result
+                elif alt < 2 or plain or alt in near:
                     try:
                         other = _FUNCS[alt](a, b)
-                        same = other is result and (result is True or result is False)
                     except BaseException:
-                        same = False
+                        continue
                 else:
-                    same = False
-                if same:
-                    keep.append(alt)
-                else:
-                    key = _key[0]
-                    if key is not None:
-                        _differs.setdefault(key, set()).add((index, alt))
-            state[1] = keep
+                    continue
+                if other is True:
+                    known |= 1 << alt
+                    true |= 1 << alt
+                elif other is False:
+                    known |= 1 << alt
+        _note(index, known << 8 | true)
         return result
 
-    def _all_differ(index, state):
-        key = _key[0]
-        if key is not None:
-            for alt in state[1]:
-                _differs.setdefault(key, set()).add((index, alt))
-        state[1] = []
+    def _note(index, outcome):
+        state = _state[index]
+        if state[0] != _context[0]:
+            state[0] = _context[0]
+            state[1] = set()
+        if outcome not in state[1]:
+            state[1].add(outcome)
+            key = _key[0]
+            if key is not None:
+                _outcomes.setdefault(key, set()).add((index, outcome))
 
     builtins.__br_compare__ = _compare
+
+    _bsites = []     # index -> (file, line, column, number of leaves)
+    _bstack = []     # open evaluations: [site index, id of the calling frame, evaluated mask, true mask]
+    _patterns = {}   # context key -> set of (site index, evaluated mask, true mask); mask -1: abandoned
+    _getframe = sys._getframe
+
+    def _abandon(entry):
+        key = _key[0]
+        if key is not None:
+            _patterns.setdefault(key, set()).add((entry[0], -1, 0))
+
+    def _find(index, frame):
+        """The open evaluation of this site by this frame. Whatever was opened after it and
+        is still open did not finish normally."""
+        position = len(_bstack) - 1
+        while position >= 0:
+            entry = _bstack[position]
+            if entry[0] == index and entry[1] == frame:
+                break
+            position -= 1
+        if position < 0:
+            return None
+        while len(_bstack) - 1 > position:
+            _abandon(_bstack.pop())
+        return _bstack[position]
+
+    def _bool_begin(index):
+        _bstack.append([index, id(_getframe(1)), 0, 0])
+        return index
+
+    def _bool_leaf(value, index, leaf):
+        entry = _find(index, id(_getframe(1)))
+        if entry is not None and entry[2] != -1:
+            try:
+                truth = True if value else False
+            except BaseException:
+                entry[2] = -1
+            else:
+                bit = 1 << leaf
+                if entry[2] & bit:
+                    entry[2] = -1
+                else:
+                    entry[2] |= bit
+                    if truth:
+                        entry[3] |= bit
+        return value
+
+    def _bool_end(index, value):
+        entry = _find(index, id(_getframe(1)))
+        if entry is not None:
+            _bstack.pop()
+            key = _key[0]
+            if key is not None:
+                _patterns.setdefault(key, set()).add((index, entry[2], entry[3] if entry[2] != -1 else 0))
+        return value
+
+    def _bool_flush():
+        while _bstack:
+            _abandon(_bstack.pop())
+
+    builtins.__br_bool_begin__ = _bool_begin
+    builtins.__br_bool_leaf__ = _bool_leaf
+    builtins.__br_bool_end__ = _bool_end
 
     class _Rewrite(ast.NodeTransformer):
         def __init__(self, rel):
@@ -103,13 +169,39 @@ if _OUT or _SEQ:
                 return node
             index = len(_sites)
             _sites.append((self.rel, node.lineno, node.col_offset, _OPS.index(type(node.ops[0]))))
-            _state.append([-1, []])
+            _state.append([-1, None])
             call = ast.Call(
                 func=ast.Name(id="__br_compare__", ctx=ast.Load()),
                 args=[node.left, node.comparators[0], ast.Constant(value=index)],
                 keywords=[],
             )
             return ast.copy_location(call, node)
+
+        def visit_BoolOp(self, node):
+            index = len(_bsites)
+            _bsites.append(None)
+            count = [0]
+            inner = self._bool(node, index, count)
+            _bsites[index] = (self.rel, node.lineno, node.col_offset, count[0])
+            begin = ast.Call(func=ast.Name(id="__br_bool_begin__", ctx=ast.Load()), args=[ast.Constant(value=index)], keywords=[])
+            call = ast.Call(func=ast.Name(id="__br_bool_end__", ctx=ast.Load()), args=[begin, inner], keywords=[])
+            return ast.copy_location(call, node)
+
+        def _bool(self, node, index, count):
+            values = []
+            for value in node.values:
+                if isinstance(value, ast.BoolOp):
+                    values.append(self._bool(value, index, count))
+                else:
+                    leaf = count[0]
+                    count[0] += 1
+                    call = ast.Call(
+                        func=ast.Name(id="__br_bool_leaf__", ctx=ast.Load()),
+                        args=[self.visit(value), ast.Constant(value=index), ast.Constant(value=leaf)],
+                        keywords=[],
+                    )
+                    values.append(ast.copy_location(call, value))
+            return ast.copy_location(ast.BoolOp(op=node.op, values=values), node)
 
     class _Loader(importlib.machinery.SourceFileLoader):
         def get_code(self, fullname):
@@ -141,14 +233,17 @@ if _OUT or _SEQ:
 
     def _switch(key):
         """Suite mode: comparisons from now on belong to test `key` (None: to nobody)."""
+        _bool_flush()
         _key[0] = key
         _context[0] += 1
 
     def _snapshot():
+        _bool_flush()
         return {
+            "bsites": _bsites,
+            "patterns": {k: sorted(v) for k, v in _patterns.items()},
             "sites": _sites,
-            "executed": {k: sorted(v) for k, v in _executed.items()},
-            "differs": {k: sorted(v) for k, v in _differs.items()},
+            "outcomes": {k: sorted(v) for k, v in _outcomes.items()},
             "argv": sys.argv[:3],
         }
 

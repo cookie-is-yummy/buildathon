@@ -67,6 +67,8 @@ class Maps:
         self._attrs = {}
         self._siblings = {}
         self._comparisons = {}
+        self._outcomes = {}
+        self._impure = None
         self._index = None
         self.all_bits = (1 << len(map_ids)) - 1
 
@@ -182,10 +184,36 @@ class Maps:
             self._attrs[path] = table
         return table
 
-    def comparison(self, path, line, column, old_operator, new_operator):
-        """For the comparison at this position of the pinned file: (tests that evaluated
-        it, tests in which `new_operator` gave a different result at least once). None if
-        the recordings do not know this comparison with this operator."""
+    def outcomes(self, path, line, column, leaves):
+        """For the and/or expression at that position: [(operands evaluated, operands true,
+        tests)], one per distinct outcome seen (operands evaluated < 0: an evaluation that
+        did not finish). None when unknown."""
+        table = self._outcomes.get(path)
+        if table is None:
+            name = os.path.join(MAPS, "bool", path.replace("/", "__") + ".json")
+            table = {}
+            if os.path.exists(name):
+                raw = json.load(open(name))
+                sets = raw["sets"]
+                for site in raw["sites"]:
+                    table[(site[0], site[1])] = (site[2], site[3], sets)
+            self._outcomes[path] = table
+        site = table.get((line, column))
+        if site is None or site[0] != leaves:
+            return None
+        return [(operands, true, int(site[2][tests], 16)) for operands, true, tests in site[1]]
+
+    def impure_properties(self):
+        if self._impure is None:
+            name = os.path.join(MAPS, "bool", "_properties.json")
+            self._impure = frozenset(json.load(open(name))["impure"])
+        return self._impure
+
+    def comparison(self, path, line, column, operator):
+        """For the two-operand comparison at that position: [(known, true, tests)], one
+        per distinct outcome seen. Bit i of `known`: the answer of operator i (numbered as
+        in _COMPARISONS) for the two operands is known; bit i of `true`: it is True.
+        None when the comparison is unknown."""
         table = self._comparisons.get(path)
         if table is None:
             name = os.path.join(MAPS, "cmp", path.replace("/", "__") + ".json")
@@ -194,15 +222,12 @@ class Maps:
                 raw = json.load(open(name))
                 sets = raw["sets"]
                 for site in raw["sites"]:
-                    table[(site[0], site[1])] = (site[2], site[3], site[4], sets)
+                    table[(site[0], site[1])] = (site[2], site[3], sets)
             self._comparisons[path] = table
         site = table.get((line, column))
-        if site is None or site[0] != old_operator:
+        if site is None or site[0] != operator:
             return None
-        differs = site[2][new_operator]
-        if differs is None:
-            return None
-        return int(site[3][site[1]], 16), int(site[3][differs], 16)
+        return [(known, true, int(site[2][tests], 16)) for known, true, tests in site[1]]
 
     def numbers(self, bits):
         out = []
@@ -772,7 +797,7 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
             found = []
             if _operator_swaps(a, b, found, True) and found:
                 diff.swaps.append((False, a.lineno, _header_last_line(a), found))
-                diff.reasons.append("comparison operator at line %d" % found[0][0])
+                diff.reasons.append("%s operator at line %d" % (_SWAP_NAMES[found[0][0]], found[0][1]))
             else:
                 diff.statements.append((a.lineno, _header_last_line(a)))
         for field in _BODY_FIELDS:
@@ -814,7 +839,7 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
             swapped = []
             if len(found) == 1 and _operator_swaps(a, b, swapped) and swapped:
                 diff.swaps.append((True, found[0], found[0], swapped))
-                diff.reasons.append("comparison operator in the lambda at line %d" % found[0])
+                diff.reasons.append("%s operator in the lambda at line %d" % (_SWAP_NAMES[swapped[0][0]], found[0]))
                 return
             diff.lambdas.extend(found)
             diff.reasons.append("body of a module or class level lambda at line %d" % found[0])
@@ -834,11 +859,12 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
                 return
     found = []
     if _operator_swaps(a, b, found) and found:
-        # Only the operator of some comparisons changed (`is` to `==`, `<` to `<=`, ...).
-        # The recordings know, per test, whether that comparison was evaluated and whether
-        # the other operator would ever have given a different result.
+        # Only the operator of some comparisons changed (`is` to `==`, `<` to `<=`, ...), or
+        # `and`/`or` between the same operands. The recordings know, per test, whether that
+        # expression was evaluated and whether the new operator would ever have given a
+        # different result.
         diff.swaps.append((False, a.lineno, a.end_lineno, found))
-        diff.reasons.append("comparison operator at line %d" % found[0][0])
+        diff.reasons.append("%s operator at line %d" % (_SWAP_NAMES[found[0][0]], found[0][1]))
         return
     if function is None:
         diff.reasons.append("module or class level statement at line %d" % a.lineno)
@@ -857,11 +883,33 @@ def _literal(node):
                              ast.DictComp, ast.SetComp, ast.GeneratorExp, ast.Lambda))
 
 
-def _operator_swaps(a, b, found, header=False):
+_SWAP_NAMES = {"cmp": "comparison", "bool": "and/or"}
+# (node type, field): the value of that expression is only ever tested for truth
+_TRUTH_ONLY = {(ast.If, "test"), (ast.While, "test"), (ast.IfExp, "test"), (ast.Assert, "test"),
+               (ast.comprehension, "ifs")}
+
+
+def _bool_tree(node, leaves):
+    """An and/or expression as (is_and, children); a child is such a pair again or the
+    position in `leaves` of an operand that is not itself and/or."""
+    children = []
+    for value in node.values:
+        if isinstance(value, ast.BoolOp):
+            children.append(_bool_tree(value, leaves))
+        else:
+            children.append(len(leaves))
+            leaves.append(value)
+    return isinstance(node.op, ast.And), tuple(children)
+
+
+def _operator_swaps(a, b, found, header=False, truth=False):
     """True when a and b are the same code except that some two-operand comparisons use a
-    different operator. Those are appended to `found` as (line, column, old, new), with
-    operators numbered as in _COMPARISONS. With `header`, the nested statement lists of a
-    compound statement are not compared (the caller does that)."""
+    different operator, or some and/or expressions combine the same operands differently.
+    Those are appended to `found` as ("cmp", line, column, old, new), with operators
+    numbered as in _COMPARISONS, or ("bool", line, column, old tree, new tree, truth,
+    operands), where `truth` says the expression's value is only tested for truth. With
+    `header`, the nested statement lists of a compound statement are not compared (the
+    caller does that)."""
     if type(a) is not type(b):
         return False
     if isinstance(a, ast.Compare) and len(a.ops) == 1 and len(b.ops) == 1 and type(a.ops[0]) is not type(b.ops[0]):
@@ -870,8 +918,21 @@ def _operator_swaps(a, b, found, header=False):
             return False
         if new in (ast.Is, ast.IsNot) and (_literal(b.left) or _literal(b.comparators[0])):
             return False
-        found.append((a.lineno, a.col_offset, _COMPARISONS.index(old), _COMPARISONS.index(new)))
+        found.append(("cmp", a.lineno, a.col_offset, _COMPARISONS.index(old), _COMPARISONS.index(new)))
         return _operator_swaps(a.left, b.left, found) and _operator_swaps(a.comparators[0], b.comparators[0], found)
+    if isinstance(a, ast.BoolOp):
+        old_leaves, new_leaves = [], []
+        old_tree, new_tree = _bool_tree(a, old_leaves), _bool_tree(b, new_leaves)
+        if old_tree != new_tree:
+            if len(old_leaves) != len(new_leaves):
+                return False
+            if any(_dump(x) != _dump(y) for x, y in zip(old_leaves, new_leaves)):
+                return False
+            found.append(("bool", a.lineno, a.col_offset, old_tree, new_tree, truth, old_leaves))
+            return True
+        below = truth
+    else:
+        below = isinstance(a, ast.UnaryOp) and isinstance(a.op, ast.Not)
     for name in a._fields:
         x, y = getattr(a, name, None), getattr(b, name, None)
         if header and name in _BODY_FIELDS and isinstance(x, list):
@@ -888,18 +949,19 @@ def _operator_swaps(a, b, found, header=False):
                         return False
                     if (h.guard is None) != (k.guard is None):
                         return False
-                    if h.guard is not None and not _operator_swaps(h.guard, k.guard, found):
+                    if h.guard is not None and not _operator_swaps(h.guard, k.guard, found, False, True):
                         return False
             continue
+        inner = below or (type(a), name) in _TRUTH_ONLY
         if isinstance(x, ast.AST):
-            if not isinstance(y, ast.AST) or not _operator_swaps(x, y, found):
+            if not isinstance(y, ast.AST) or not _operator_swaps(x, y, found, False, inner):
                 return False
         elif isinstance(x, list):
             if not isinstance(y, list) or len(x) != len(y):
                 return False
             for i, j in zip(x, y):
                 if isinstance(i, ast.AST):
-                    if not isinstance(j, ast.AST) or not _operator_swaps(i, j, found):
+                    if not isinstance(j, ast.AST) or not _operator_swaps(i, j, found, False, inner):
                         return False
                 elif i != j or type(i) is not type(j):
                     return False
@@ -1129,6 +1191,104 @@ def read_pinned(path):
         return handle.read()
 
 
+# Calls that cannot change anything: these builtins, `<x>.args.get(...)` (the argument
+# dictionary of an expression) and methods that only strings have.
+_PURE_BUILTINS = frozenset((
+    "isinstance", "issubclass", "len", "getattr", "hasattr", "type", "callable", "bool", "str", "int",
+    "float", "any", "all", "abs", "repr", "id",
+))
+_PURE_METHODS = frozenset((
+    "startswith", "endswith", "upper", "lower", "strip", "lstrip", "rstrip", "isdigit", "isalpha",
+    "isalnum", "isupper", "islower", "isspace", "isidentifier", "casefold",
+))
+
+
+def _pure(node, impure_names):
+    """True when evaluating the expression cannot change any state, so that leaving the
+    evaluation out is invisible. `impure_names`: attribute names that are properties with
+    a body that does more than return a pure expression."""
+    if node is None or isinstance(node, (ast.Constant, ast.Name, ast.Lambda)):
+        return True
+    if isinstance(node, ast.Attribute):
+        return node.attr not in impure_names and _pure(node.value, impure_names)
+    if isinstance(node, ast.Subscript):
+        # a constant index only: a computed key could create an entry in a defaultdict
+        index = node.slice
+        if isinstance(index, ast.UnaryOp):
+            index = index.operand
+        return isinstance(index, ast.Constant) and _pure(node.value, impure_names)
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Name):
+            if func.id not in _PURE_BUILTINS:
+                return False
+            if func.id in ("getattr", "hasattr"):
+                # reads an attribute by name: the same rule as for `x.name`
+                name = node.args[1] if len(node.args) > 1 else None
+                if not (isinstance(name, ast.Constant) and isinstance(name.value, str)) or name.value in impure_names:
+                    return False
+        elif isinstance(func, ast.Attribute):
+            if func.attr == "get":
+                if not (isinstance(func.value, ast.Attribute) and func.value.attr == "args"):
+                    return False
+            elif func.attr not in _PURE_METHODS:
+                return False
+            if not _pure(func.value, impure_names):
+                return False
+        else:
+            return False
+        return all(_pure(arg, impure_names) for arg in node.args) and all(
+            _pure(keyword.value, impure_names) for keyword in node.keywords)
+    if isinstance(node, (ast.Compare, ast.UnaryOp, ast.BinOp, ast.BoolOp, ast.IfExp, ast.Tuple, ast.List,
+                         ast.Set, ast.Dict, ast.JoinedStr, ast.FormattedValue, ast.Starred, ast.Slice,
+                         ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp, ast.comprehension)):
+        if isinstance(node, ast.comprehension) and node.is_async:
+            return False
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.expr, ast.comprehension)) and not _pure(child, impure_names):
+                return False
+        return True
+    return False
+
+
+def _bool_run(tree, evaluated, true, used):
+    """Evaluate an and/or tree on recorded operand outcomes. Returns the operand whose
+    value is the result, or None when an operand is needed that was not evaluated."""
+    is_and, children = tree
+    result = None
+    for child in children:
+        if isinstance(child, int):
+            if not evaluated >> child & 1:
+                return None
+            used.append(child)
+            result = child
+        else:
+            result = _bool_run(child, evaluated, true, used)
+            if result is None:
+                return None
+        if bool(true >> result & 1) != is_and:
+            break
+    return result
+
+
+def _same_outcome(old_tree, new_tree, evaluated, true, truth, pure):
+    """Would the new and/or expression, given these operand outcomes, do the same as the
+    old one did: same result, no operand evaluated that was not evaluated before, and only
+    side-effect-free operands left out?"""
+    used_old, used_new = [], []
+    old = _bool_run(old_tree, evaluated, true, used_old)
+    if old is None or sum(1 << leaf for leaf in used_old) != evaluated:
+        return False
+    new = _bool_run(new_tree, evaluated, true, used_new)
+    if new is None:
+        return False
+    if any(not pure[leaf] for leaf in used_old if leaf not in used_new):
+        return False
+    if truth:
+        return (true >> old & 1) == (true >> new & 1)
+    return old == new
+
+
 def select_python(change, maps, notes):
     path = change.old
     if change.binary:
@@ -1163,12 +1323,33 @@ def select_python(change, maps, notes):
         # operator give a different result. Its run is then step for step the same. A test
         # that executes the statement but was not seen evaluating the comparison stays in.
         executing = maps.started(path, first, last) if in_lambda else maps.covering(path, first, last)
-        for line, column, old_operator, new_operator in sites:
-            known = maps.comparison(path, line, column, old_operator, new_operator)
-            if known is None:
-                bits |= executing
-                break
-            evaluated, differs = known
+        for site in sites:
+            if site[0] == "cmp":
+                line, column, old_operator, new_operator = site[1:]
+                seen = maps.comparison(path, line, column, old_operator)
+                if seen is None:
+                    bits |= executing
+                    break
+                evaluated = differs = 0
+                both = 1 << old_operator | 1 << new_operator
+                for known, true, tests in seen:
+                    evaluated |= tests
+                    # same answer only if both are known and both True or both False
+                    if known & both != both or (true & both) not in (0, both):
+                        differs |= tests
+            else:
+                line, column, old_tree, new_tree, truth, leaves = site[1:]
+                known = maps.outcomes(path, line, column, len(leaves))
+                if known is None:
+                    bits |= executing
+                    break
+                impure_names = maps.impure_properties()
+                pure = [_pure(leaf, impure_names) for leaf in leaves]
+                evaluated = differs = 0
+                for operands, true, tests in known:
+                    evaluated |= tests
+                    if operands < 0 or not _same_outcome(old_tree, new_tree, operands, true, truth, pure):
+                        differs |= tests
             bits |= (executing & ~(evaluated & ~differs)) | differs
     for line in diff.lambdas:
         bits |= maps.started(path, line, line)
@@ -1180,7 +1361,7 @@ def select_python(change, maps, notes):
             bits |= maps.covering(path, lines[0], lines[1])
         else:
             bits |= found[0]
-    notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s), %d comparison(s) %s" % (
+    notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s), %d operator(s) %s" % (
         path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes), len(diff.swaps),
         "; ".join(diff.reasons[:2])))
     return bits
