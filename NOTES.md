@@ -24,9 +24,7 @@ before the competition we recorded, at the pinned commit, what every test uses:
 - which modules it **tries to import and does not find**,
 - which **class attributes** it reads,
 - for every **comparison** it evaluates, how the two operands relate (same object,
-  equal, less),
-- for every **`and`/`or`** it evaluates, which operands were evaluated and which were
-  true.
+  equal, less).
 
 These recordings ("maps") depend only on the pinned commit. They are the same whatever
 patches arrive. At run time the selector works out *what a patch changes* and looks up
@@ -174,18 +172,33 @@ Details that keep this honest:
 - Unknown counts as different. If the recorder could not ask an operator (see next
   point), or asking raised, or the comparison did not return `True`/`False`, the test
   stays selected.
-- Asking `==` of arbitrary objects runs their `__eq__`. So for operands that are not plain
-  built-in values the recorder asks only the *closest* operator (`is` with `==`, `==`
-  with `!=`, `<` with `<=`, `>` with `>=`) and identity, which runs no code. A swap to a
-  far operator (say `==` to `<` on expression objects) is therefore never narrowed.
+- **The recorder must not disturb the test it watches.** Asking `==` of two arbitrary
+  objects runs their `__eq__`, and that can change things: comparing two sqlglot
+  expressions computes and *caches* their hash, so the program later skips work it
+  would normally do, and the recording no longer shows what the test really does. (We
+  got this wrong at first; see "Mistakes" below.) So the recorder asks only questions
+  that cannot change anything:
+  - plain values (`None`, numbers, strings, bytes, enum members that are numbers, short
+    tuples of those): every operator;
+  - objects with no `__eq__` of their own: `==` is the same as `is`, nothing is called;
+  - built-in containers: `==` only against a plain value or an object of the previous
+    kind (that never looks inside the container);
+  - objects whose class defines `__eq__` in Python: only `== None` (sqlglot has four
+    such methods; all four return at once for `None`);
+  - identity always, since it runs no code.
+  Everything else stays unknown. A swap of `is` to `==` between two expression objects,
+  or of `==` to `<` on anything but plain values, is therefore never narrowed.
+- Code that runs only because the recorder asked something (an `__eq__` asked about
+  `None`) is recorded like the test's own code. A recording may therefore hold more than
+  the test does on its own, never less; more only ever keeps a test selected.
 - A swap **to** `is`/`is not` next to a literal makes Python print a `SyntaxWarning` when
   the module is compiled. We cannot rule out that a test treats warnings as errors, so
   that case is not narrowed.
 - Chained comparisons (`a < b < c`) are not recorded and not narrowed.
 - The map is the union of independent runs: every test alone in a fresh process (child
-  processes included), plus the whole suite in normal and in reversed order, all of that
-  done more than once (Python randomises string hashing per process, which can change the
-  order in which a set is walked). A test whose own run failed under the recorder is
+  processes included), plus the whole suite in normal and in reversed order (Python
+  randomises string hashing per process, which can change the order in which a set is
+  walked, so the three runs do not all see the same order). A test whose own run failed under the recorder is
   never narrowed.
 - The recording was made with the same Python version as the image, so the positions
   (line, column) of comparisons in the syntax tree match what the selector computes.
@@ -194,30 +207,14 @@ On the sample this moves three commits from "run the 21 s test" to "run nothing"
 (`is` -> `==` on an enum member, `is None` -> `== None`, `<` -> `<=`): the tests execute
 the line, the operands never distinguish the two operators, and indeed nothing fails.
 
-### `and` / `or`
+### `and` / `or` (written, switched off)
 
-The same idea. `if a and b:` rewritten as `if a or b:` behaves identically in a test for
-which `a` and `b` were both true every time. The recording notes, for every and/or
-expression and every test, the distinct outcomes: which operands were evaluated (the
-later ones are skipped when the result is already decided) and which of those were true.
-An evaluation that did not finish (an operand raised) is noted as such.
-
-For a patch that only regroups the same operands with different `and`/`or`, the selector
-replays each recorded outcome through the old and the new expression. A test stays
-unaffected only if for every outcome:
-
-- the new expression needs **no operand that was not evaluated** (we do not know its
-  value, and evaluating it might do anything);
-- the result is the same: the same operand's value, or, where the expression is only
-  tested for truth (`if`, `while`, `not`, a conditional expression, a comprehension
-  filter), the same truth value;
-- every operand the new expression **no longer evaluates is free of side effects**. This
-  is decided from the code, strictly: names, constants, attribute reads, constant
-  indexing, comparisons, `not`, `isinstance`/`len`/`getattr`-like builtins, string
-  predicates and `<expression>.args.get(...)`. Any other call (`self._match(...)`
-  advances the parser) is assumed to change state, and so is reading an attribute whose
-  name is a property anywhere in sqlglot unless that property just returns such an
-  expression (`maps/bool/_properties.json`, built from the pinned source).
+`selector.py` also contains two rules that use a recording of every `and`/`or`
+expression (which operands a test evaluated, and which were true): one for a patch that
+swaps `and` and `or`, one for a patch confined to a later operand of such an expression.
+Both do nothing unless `maps/bool/` exists, and it is **not shipped** in this version:
+their checks (below) had not finished. Without that directory the selector treats such
+patches like any other changed statement.
 
 ### Tests that inspect code instead of running it
 
@@ -333,6 +330,20 @@ Listed from most to least worrying.
 6. **Timeouts.** A patch that makes a test hang counts as a failure. Such a test executes
    the changed statement, so it is selected; this needs no special handling.
 
+## Mistakes made along the way
+
+- **The comparison recorder changed what it was watching.** Its first version asked `==`
+  between any two objects to learn how they relate. Between two sqlglot expressions that
+  computes their hash and stores it on the object. Later code then found the hash ready
+  and skipped computing it, so the recording showed fewer tests running the hash code
+  than really do. Nothing in the sample or in our synthetic sets noticed. It was caught
+  by the check that runs every test a rule leaves out (next section): for an `and` -> `or`
+  swap inside `Expression.__hash__`, 47 of 94 left-out tests failed. The recorder was
+  rewritten to ask only harmless questions (see "Comparison operators"), everything was
+  recorded again, and the checks were repeated from scratch on the new maps.
+- The same first version also made the recording extremely slow (the question re-entered
+  `Expression.__eq__` until Python's recursion limit, on every comparison of expressions).
+
 ## Results log
 
 | Step | Sample score (s) | Misses | CPU (s) | Synthetic set |
@@ -346,9 +357,12 @@ Listed from most to least worrying.
 
 | + statement-level handling of added/removed statements, package-inspection rule, parser hardening | 170.202 | 0 | 0.12 (in Docker) | see below |
 
-By kind on the sample at the last step: code 142.1 s (16 commits; the best possible is
+| + comparison-operator rule (maps of observed operand outcomes) | 117.425 | 0 | 0.12 | all five sets below: 0 misses; plus the left-out-tests check below |
+
+By kind on the sample at the last step: code 89.3 s (16 commits; the best possible is
 79.1 s), comment 0.0 s (3), fixture 17.9 s (8; best possible 17.9), multi 10.2 s (3; best
-possible 10.2). "Best possible" means selecting exactly the failing tests.
+possible 10.2). "Best possible" means selecting exactly the failing tests. Before the
+comparison rule the code commits cost 142.1 s.
 
 ### Local evaluation sets (never shipped, never read by the selector)
 
