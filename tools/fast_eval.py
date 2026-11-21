@@ -25,7 +25,8 @@ for f in sorted(glob.glob(syn + "/fast/*.json")):
     k = stats[meta[cid]["kind"]]
     k[0] += 1
     k[1] += bool(failed)
-    miss = not failed <= chosen
+    crashed = g["status"] != "ok"  # the test process died (e.g. out of memory): no per-test verdicts
+    miss = not failed <= chosen and not crashed
     k[2] += miss
     k[3] += cost
     k[4] += len(chosen)
