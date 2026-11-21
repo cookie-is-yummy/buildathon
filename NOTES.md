@@ -450,7 +450,8 @@ Every one of them must pass. A single failure means the rule or the recording is
 
 | Rule | Patches | Left-out tests run | Failed |
 | --- | --- | --- | --- |
-| Comparison operator swapped (all 46 pairs of operators that occur) | 400 | 31,173 | 0 |
+| Comparison operator swapped, first recording | 400 | 31,173 | 0 |
+| Comparison operator swapped, shipped maps, a fresh draw of patches | 400 | 43,713 | 0 |
 | `and` <-> `or` (200 each way) | 400 | 39,876 | 0 |
 | Later operand: the operand replaced by an expression that raises as soon as it is evaluated | 400 | 51,721 | 0 |
 
@@ -460,7 +461,8 @@ test that evaluates the operand even once crashes.
 History, so the numbers are not read as more than they are. The comparison check was
 run with the first recording. After the recorder was rewritten (see "Mistakes"), the
 same 400 patches were looked at again with the new maps: on 392 the same tests are left
-out, on 6 fewer, and on 2 one more test each; those two were run and pass. The `and`/`or`
+out, on 6 fewer, and on 2 one more test each; those two were run and pass. Then a fresh
+draw of 400 patches was checked against the shipped maps (second row). The `and`/`or`
 check that caught the mistake was thrown away and both `and`/`or` checks were generated
 and run afresh on the new maps. Merging the second recording pass changed what is left
 out on one of the 800 patches (fewer tests). Later the side-effect judgement was made
