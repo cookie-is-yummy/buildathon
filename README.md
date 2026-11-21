@@ -27,7 +27,7 @@ same whatever the patches are.
 | `selector.py`, `run.py` | The program the image runs. Standard library only. |
 | `replay.py` | Started by the selector for some commits: repeats the sqlglot calls of the slow executor test on the patched code and compares fingerprints of what they return. Runs the pinned sqlglot. |
 | `maps/` | Recordings of the pinned commit, as plain JSON (see `tools/build_maps.py`). |
-| `pinned/` | The Python files (and two config files) of sqlglot at the pinned commit. The selector needs their text to rebuild a patched file. Also the TPC-DS fixture files (`tests/fixtures/optimizer/tpc-ds/`) that `replay.py` reads. |
+| `pinned.tar.xz` | Unmodified files of sqlglot at the pinned commit, packed to keep the repository small: its Python files and two config files (the selector needs their text to rebuild a patched file) and the TPC-DS fixture files (`tests/fixtures/optimizer/tpc-ds/`) that `replay.py` reads. The image unpacks it to `pinned/`; to work locally, `tar -xJf pinned.tar.xz`. |
 | `tools/` | How the maps were made, and the local evaluation harness. Not used at run time. |
 | `Dockerfile`, `Makefile`, `score.py`, `SCORING.md`, `sample/` | From the organisers' starter kit. |
 
@@ -52,6 +52,10 @@ python3 tools/build_replay_maps.py rec/phase rec/replay.json .
 make build                     # again, now with maps/replay.json
 ```
 
+`build_maps.py` writes the pinned sources to `pinned/`; the tracked archive is made from it
+with `tar --sort=name --exclude=__pycache__ -cJf pinned.tar.xz pinned` (after copying
+`tests/fixtures/optimizer/tpc-ds/` from the checkout into `pinned/`).
+
 The recordings run each test under the labelling image and package versions
 (`requirements.lock`), with a recorder loaded into every Python process the test starts.
 See [tools/README.md](tools/README.md).
@@ -65,9 +69,9 @@ python3 tools/evaluate.py sample sample/answers.json   # same without Docker, wi
 
 ## Open-source code used
 
-- **sqlglot** (MIT, © Toby Mao). `pinned/` holds unmodified copies of its Python source
-  files, `pyproject.toml` and `setup.cfg` at the pinned commit, with its licence in
-  `pinned/LICENSE`. The maps in `maps/` were recorded by running its test suite.
+- **sqlglot** (MIT, © Toby Mao). `pinned.tar.xz` holds unmodified copies of its Python
+  source files, `pyproject.toml`, `setup.cfg` and the TPC-DS test fixtures at the pinned
+  commit, with its licence in `pinned/LICENSE`. The maps in `maps/` were recorded by running its test suite.
 - **python-dateutil** 4.0.0 (Apache 2.0 / BSD) and **mypy_extensions** 1.2.0 (MIT) are
   installed into the image from PyPI. sqlglot imports them when they are present, as they
   are where the tests run, and `replay.py` runs the pinned sqlglot. The selector itself

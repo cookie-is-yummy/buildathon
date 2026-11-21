@@ -6,7 +6,8 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 RUN pip install --no-cache-dir --no-deps python-dateutil==4.0.0 mypy_extensions==1.2.0 || true
 COPY selector.py run.py replay.py /app/
 COPY maps /app/maps
-COPY pinned /app/pinned
+# pinned.tar.xz: sqlglot at the pinned commit (see README); ADD unpacks it to /app/pinned
+ADD pinned.tar.xz /app/
 # Bytecode for the selector and the pinned sources, then the fingerprints replay.py
 # compares against (computed from the pinned sources only). If that step cannot run, the
 # file is not written and the selector simply does without it.
