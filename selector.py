@@ -66,6 +66,7 @@ class Maps:
         self._lines = {}
         self._attrs = {}
         self._siblings = {}
+        self._comparisons = {}
         self._index = None
         self.all_bits = (1 << len(map_ids)) - 1
 
@@ -180,6 +181,28 @@ class Maps:
             table = json.load(open(name)) if os.path.exists(name) else {}
             self._attrs[path] = table
         return table
+
+    def comparison(self, path, line, column, old_operator, new_operator):
+        """For the comparison at this position of the pinned file: (tests that evaluated
+        it, tests in which `new_operator` gave a different result at least once). None if
+        the recordings do not know this comparison with this operator."""
+        table = self._comparisons.get(path)
+        if table is None:
+            name = os.path.join(MAPS, "cmp", path.replace("/", "__") + ".json")
+            table = {}
+            if os.path.exists(name):
+                raw = json.load(open(name))
+                sets = raw["sets"]
+                for site in raw["sites"]:
+                    table[(site[0], site[1])] = (site[2], site[3], site[4], sets)
+            self._comparisons[path] = table
+        site = table.get((line, column))
+        if site is None or site[0] != old_operator:
+            return None
+        differs = site[2][new_operator]
+        if differs is None:
+            return None
+        return int(site[3][site[1]], 16), int(site[3][differs], 16)
 
     def numbers(self, bits):
         out = []
@@ -507,6 +530,10 @@ class Diff:
         # class attributes whose assigned value changed:
         # (class qualname, attribute, class node, (first, last) lines of the assignment)
         self.attributes = []
+        # statements whose only change is the operator of comparisons:
+        # (in a module/class level lambda?, first line, last line of the statement or the
+        # lambda's line, [(line, column, old operator, new operator)])
+        self.swaps = []
         self.docstrings = 0  # class or module docstrings whose text changed
         self.changed_top = []  # new-side module/class level statements that may differ
         self.reasons = []
@@ -742,7 +769,12 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
         # inside `if`/`try` blocks of a class body we no longer track which class we are in
         nested_owner = False if owner else owner
         if _header_dump(a) != _header_dump(b):
-            diff.statements.append((a.lineno, _header_last_line(a)))
+            found = []
+            if _operator_swaps(a, b, found, True) and found:
+                diff.swaps.append((False, a.lineno, _header_last_line(a), found))
+                diff.reasons.append("comparison operator at line %d" % found[0][0])
+            else:
+                diff.statements.append((a.lineno, _header_last_line(a)))
         for field in _BODY_FIELDS:
             old_part, new_part = getattr(a, field, None), getattr(b, field, None)
             if isinstance(old_part, list) and (old_part or new_part):
@@ -779,6 +811,11 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
         if _only_lambda_bodies_differ(a, b, found) and found:
             # e.g. one entry of a class-level table of lambdas: the table is built the same
             # way at import; only tests that call that lambda run the changed code.
+            swapped = []
+            if len(found) == 1 and _operator_swaps(a, b, swapped) and swapped:
+                diff.swaps.append((True, found[0], found[0], swapped))
+                diff.reasons.append("comparison operator in the lambda at line %d" % found[0])
+                return
             diff.lambdas.extend(found)
             diff.reasons.append("body of a module or class level lambda at line %d" % found[0])
             return
@@ -795,8 +832,80 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
                 diff.attributes.append((owner[0], target, True, (a.lineno, a.end_lineno)))
                 diff.reasons.append("class attribute %s.%s (entries removed)" % (owner[0], target))
                 return
+    found = []
+    if _operator_swaps(a, b, found) and found:
+        # Only the operator of some comparisons changed (`is` to `==`, `<` to `<=`, ...).
+        # The recordings know, per test, whether that comparison was evaluated and whether
+        # the other operator would ever have given a different result.
+        diff.swaps.append((False, a.lineno, a.end_lineno, found))
+        diff.reasons.append("comparison operator at line %d" % found[0][0])
+        return
+    if function is None:
         diff.reasons.append("module or class level statement at line %d" % a.lineno)
     diff.statements.append((a.lineno, a.end_lineno))
+
+
+_COMPARISONS = (ast.Is, ast.IsNot, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+_SINGLETONS = (None, True, False, Ellipsis)
+
+
+def _literal(node):
+    """A literal for which `is` makes the compiler emit a warning."""
+    if isinstance(node, ast.Constant):
+        return not any(node.value is single for single in _SINGLETONS)
+    return isinstance(node, (ast.Tuple, ast.List, ast.Dict, ast.Set, ast.JoinedStr, ast.ListComp,
+                             ast.DictComp, ast.SetComp, ast.GeneratorExp, ast.Lambda))
+
+
+def _operator_swaps(a, b, found, header=False):
+    """True when a and b are the same code except that some two-operand comparisons use a
+    different operator. Those are appended to `found` as (line, column, old, new), with
+    operators numbered as in _COMPARISONS. With `header`, the nested statement lists of a
+    compound statement are not compared (the caller does that)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.Compare) and len(a.ops) == 1 and len(b.ops) == 1 and type(a.ops[0]) is not type(b.ops[0]):
+        old, new = type(a.ops[0]), type(b.ops[0])
+        if old not in _COMPARISONS or new not in _COMPARISONS:
+            return False
+        if new in (ast.Is, ast.IsNot) and (_literal(b.left) or _literal(b.comparators[0])):
+            return False
+        found.append((a.lineno, a.col_offset, _COMPARISONS.index(old), _COMPARISONS.index(new)))
+        return _operator_swaps(a.left, b.left, found) and _operator_swaps(a.comparators[0], b.comparators[0], found)
+    for name in a._fields:
+        x, y = getattr(a, name, None), getattr(b, name, None)
+        if header and name in _BODY_FIELDS and isinstance(x, list):
+            continue
+        if header and name in ("handlers", "cases"):
+            if len(x) != len(y):
+                return False
+            for h, k in zip(x, y):
+                if name == "handlers":
+                    if (h.type and _dump(h.type), h.name) != (k.type and _dump(k.type), k.name):
+                        return False
+                else:
+                    if _dump(h.pattern) != _dump(k.pattern):
+                        return False
+                    if (h.guard is None) != (k.guard is None):
+                        return False
+                    if h.guard is not None and not _operator_swaps(h.guard, k.guard, found):
+                        return False
+            continue
+        if isinstance(x, ast.AST):
+            if not isinstance(y, ast.AST) or not _operator_swaps(x, y, found):
+                return False
+        elif isinstance(x, list):
+            if not isinstance(y, list) or len(x) != len(y):
+                return False
+            for i, j in zip(x, y):
+                if isinstance(i, ast.AST):
+                    if not isinstance(j, ast.AST) or not _operator_swaps(i, j, found):
+                        return False
+                elif i != j or type(i) is not type(j):
+                    return False
+        elif x != y or type(x) is not type(y):
+            return False
+    return True
 
 
 def _subsequence(new, old):
@@ -1037,7 +1146,7 @@ def select_python(change, maps, notes):
     if diff is None:
         notes.append("%s no longer compiles: every test importing it" % path)
         return bits | maps.importers(path)
-    if diff.whole_module or diff.statements or diff.functions or diff.lambdas or diff.attributes:
+    if diff.whole_module or diff.statements or diff.functions or diff.lambdas or diff.attributes or diff.swaps:
         # the code changed (not just comments): tests that inspect this package's modules
         bits |= maps.sibling_readers(path)
     if diff.whole_module:
@@ -1049,6 +1158,18 @@ def select_python(change, maps, notes):
         bits |= maps.started(path, first, last)
     for first, last in diff.statements:
         bits |= maps.covering(path, first, last)
+    for in_lambda, first, last, sites in diff.swaps:
+        # Unaffected: a test that evaluated every changed comparison and never saw the new
+        # operator give a different result. Its run is then step for step the same. A test
+        # that executes the statement but was not seen evaluating the comparison stays in.
+        executing = maps.started(path, first, last) if in_lambda else maps.covering(path, first, last)
+        for line, column, old_operator, new_operator in sites:
+            known = maps.comparison(path, line, column, old_operator, new_operator)
+            if known is None:
+                bits |= executing
+                break
+            evaluated, differs = known
+            bits |= (executing & ~(evaluated & ~differs)) | differs
     for line in diff.lambdas:
         bits |= maps.started(path, line, line)
     for qualname, name, entries_removed, lines in diff.attributes:
@@ -1059,8 +1180,8 @@ def select_python(change, maps, notes):
             bits |= maps.covering(path, lines[0], lines[1])
         else:
             bits |= found[0]
-    notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s) %s" % (
-        path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes),
+    notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s), %d comparison(s) %s" % (
+        path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes), len(diff.swaps),
         "; ".join(diff.reasons[:2])))
     return bits
 
