@@ -579,12 +579,60 @@ def _only_constant_defaults_differ(a, b):
     return True
 
 
+def _runs(statement):
+    """False for statements that execute nothing (and so never show up in a recording)."""
+    if isinstance(statement, (ast.Pass, ast.Global, ast.Nonlocal)):
+        return False
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+        return False
+    return not (isinstance(statement, ast.AnnAssign) and statement.value is None)
+
+
+def _statement_range(statement):
+    first = statement.lineno
+    for decorator in getattr(statement, "decorator_list", ()):
+        first = min(first, decorator.lineno)
+    return first, statement.end_lineno
+
+
+def _diff_reshaped_body(old_body, new_body, diff):
+    """Statements were added to, removed from or replaced in a block inside a function.
+
+    Line the two blocks up on their unchanged statements. A test's run can first differ
+    from before only where it meets a removed or replaced statement (it executed that
+    statement before, so the statement's lines name it) or where it reaches an inserted
+    one (it then went on to execute the next old statement that runs anything, or, at the
+    end of the block, had executed the previous one). Returns False if no such anchor
+    exists; the caller then falls back to everyone who ran the function.
+    """
+    import difflib
+
+    old_dumps = [_dump(x) for x in old_body]
+    new_dumps = [_dump(x) for x in new_body]
+    ranges = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_dumps, new_dumps, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        for statement in old_body[i1:i2]:
+            ranges.append(_statement_range(statement))
+        if j2 > j1 and any(_runs(x) for x in new_body[j1:j2]):
+            anchor = next((x for x in old_body[i1:] if _runs(x)), None)
+            if anchor is None:
+                anchor = next((x for x in reversed(old_body[:i1]) if _runs(x)), None)
+            if anchor is None:
+                return False
+            ranges.append(_statement_range(anchor))
+    diff.statements.extend(ranges)
+    diff.reasons.append("statements added or removed inside a function")
+    return True
+
+
 def _diff_bodies(old_body, new_body, function, diff, old_blocks, new_blocks, pairs, owner=None):
     if len(old_body) != len(new_body) or any(type(a) is not type(b) for a, b in zip(old_body, new_body)):
         if function is None:
             diff.whole_module = True
             diff.reasons.append("statements added or removed at module or class level")
-        else:
+        elif not _diff_reshaped_body(old_body, new_body, diff):
             diff.functions.append(_function_body_range(function))
             diff.reasons.append("statements added or removed in %s" % function.name)
         return
@@ -639,6 +687,10 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
         for field in _BODY_FIELDS:
             old_part, new_part = getattr(a, field, None), getattr(b, field, None)
             if isinstance(old_part, list) and (old_part or new_part):
+                if not old_part and function is not None:
+                    # a new `else`/`finally` block: whoever runs the statement's header
+                    diff.statements.append((a.lineno, _header_last_line(a)))
+                    continue
                 _diff_bodies(old_part, new_part or [], function, diff, old_blocks, new_blocks, pairs, nested_owner)
         for field in ("handlers", "cases"):
             old_part, new_part = getattr(a, field, None), getattr(b, field, None)

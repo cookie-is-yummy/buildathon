@@ -88,10 +88,15 @@ match the pinned text: run everything). Then:
     header changed, the header lines are used.
     We use the whole statement, not just the edited line, because an edit such as
     `and` -> `or` changes which later parts of the same condition get evaluated.
-  - *The edit changes the function's shape*: statements added or removed, a name that
-    becomes local, a `yield` appearing (the function becomes a generator), `global`
-    declarations. Then any path through the function may change: select every test that
-    **started running** that function or anything defined inside it.
+  - *Statements were added, removed or replaced inside a function.* The old and new
+    blocks are lined up on their unchanged statements. A test's run can first differ only
+    where it meets a removed or replaced statement (it executed that statement before) or
+    where it reaches an inserted one (it then went on to execute the next old statement).
+    So the removed statements' lines and the neighbours of insertions are looked up.
+  - *The edit changes the function as a whole*: a name that becomes local, a `yield`
+    appearing (the function becomes a generator), `global` declarations. Then any path
+    through the function may change: select every test that **started running** that
+    function or anything defined inside it.
   - *A `def` or `class` header changed* (name, parameters, decorators, base classes): the
     header runs at import, so everyone who imports the module is selected, plus everyone
     who ran the function. (Constant defaults are the exception, see below.)
