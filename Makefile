@@ -27,3 +27,9 @@ sample: build
 check: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
 	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
+
+# Not from the kit: runs the image under the same limits and reports the CPU seconds the
+# selector used (user + system), measured by a wrapper process inside the container.
+.PHONY: cpu
+cpu: build
+	docker run $(RUN_FLAGS) $(IMAGE) python -I -S -c "import resource,subprocess,sys; subprocess.run([sys.executable,'-I','-S','/app/run.py'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); u=resource.getrusage(resource.RUSAGE_CHILDREN); print('selector CPU seconds: %.3f' % (u.ru_utime+u.ru_stime))"

@@ -202,8 +202,47 @@ nothing. The evidence is the recording of every file opened during the whole sui
 
 ## What is still risky
 
-See the list at the end of this file; it is updated with each measured step.
+Listed from most to least worrying.
+
+1. **Tests that depend on each other.** The suite is not fully order-independent: run in
+   reverse, four tests fail at the pinned commit because an earlier test left state behind
+   (one test empties the dialect registry). If a patch changes what test A leaves behind,
+   test B can fail without executing a single changed line. No coverage-based selector can
+   see that. We do not know the order or the number of pytest workers the organisers used.
+2. **The slow tests dominate the cost, not the misses.** `test_execute_tpcds` (21.5 s)
+   executes a large share of the optimizer and executor, so it is selected for roughly a
+   quarter of code changes in core modules, and each of those commits costs about 23-25 s.
+   It really does fail on about half of them in the sample. Verifying it locally costs 46
+   CPU seconds (it runs 57 queries in a process pool), more than selecting it.
+3. **Class attributes read behind the recorder's back.** A read through `cls.__dict__` or
+   `vars(cls)` does not go through the descriptor. sqlglot does this in two places, both
+   handled (the dialect metaclass, covered by the "computed attributes" rule, and a
+   presence-only check in `tokens.py`). The narrowing is also limited to edits that cannot
+   fail at import.
+4. **Empty selections.** We return nothing for: comment/format-only Python changes
+   (identical syntax tree), changes to code no test executes, function docstrings, class
+   and module docstrings (text changed, not added/removed), files no test opens, mode-only
+   changes, new files nothing lists or tries to import. Each rests on a recording of the
+   whole suite, but a wrong "nothing" costs 300 s.
+5. **New kinds of patch in the final.** Anything the parser does not recognise runs
+   everything (36.8 s), so surprises cost time, not misses, unless they slip through one
+   of the rules above in a way we did not think of.
+6. **Timeouts.** A patch that makes a test hang counts as a failure. Such a test executes
+   the changed statement, so it is selected; this needs no special handling.
 
 ## Results log
 
-(filled in below as steps are measured)
+| Step | Sample score (s) | Misses | CPU (s) | Synthetic set |
+| --- | --- | --- | --- | --- |
+| Starter kit (everything, 3 workers) | 1210.470 | 0 | ~0.05 | - |
+| v1: statement-level line maps + import/open/list maps | 214.401 | 0 | 0.34 | - |
+| + whole-suite recordings merged, docstring and default rules | 214.401 | 0 | 0.24 | - |
+| + parse only the touched statement (same answers, less CPU) | 214.401 | 0 | 0.11 | 630/630 identical to whole-file parse |
+| + class-attribute reader maps | 178.749 | 0 | 0.16 (in Docker) | 7 of 155 ground truths so far: 0 misses |
+
+By kind on the sample at the last step: code 150.7 s (16 commits; the best possible is
+79.1 s), comment 0.0 s (3), fixture 17.9 s (8; best possible 17.9), multi 10.2 s (3; best
+possible 10.2). "Best possible" means selecting exactly the failing tests.
+
+The ground-truth method was checked against the organisers' answers: running the full
+suite on three sample patches reproduced their failing sets exactly.
