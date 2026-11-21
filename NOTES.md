@@ -624,7 +624,7 @@ Listed from most to least worrying.
 
 | + replay extended (whole functions; a different plan with the same rows); cheap candidates run in the image | 112.960 | 0 | 2.8 | see "Through the image" below: all seven sets 0 misses |
 
-| + per-entry map of class-level tables | 96.914 | 0 | 2.6 | "Through the image" below; table-entry checks: 450 patches, 175,207 left-out tests, 0 failures |
+| + per-entry map of class-level tables | 96.914 | 0 | 2.9 | "Through the image" below; table-entry checks: 450 patches, 175,207 left-out tests, 0 failures |
 
 The board score of the step before the replay was 193.3 s against 117.4 s on the sample: the
 board's commits happen to select the slow executor test more often. Over every possible
@@ -690,7 +690,7 @@ are part of the score). "Rules only" is the selection before replay and candidat
 
 | Set | Commits | Rules only | Now: simulated + helper CPU | Misses |
 | --- | --- | --- | --- | --- |
-| Sample | 30 | 117.4 | 96.9 + 2.6 | 0 |
+| Sample | 30 | 117.4 | 96.9 + 2.9 | 0 |
 | Organiser-like, first | 59 | 450.7 | 344.2 + 36 | 0 |
 | Organiser-like, second | 60 | 418.8 | 365.2 + 31 | 0 |
 | Mixed kinds | 155 | 1504.8 | 1421.8 + 32 | 0 |
