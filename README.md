@@ -36,10 +36,10 @@ RUN="docker run --rm --network none -v $PWD/sqlglot:/src:ro -v $PWD/tools:/tools
 $RUN /tools/record_all.sh      # every test alone: lines, started functions, files
 $RUN /tools/record_suite.sh    # whole suite in one process, normal and reversed order
 $RUN /tools/record_attrs.sh    # every test alone: class attributes read
-$RUN /tools/record_cmp.sh      # comparisons and and/or: what each test observed
+$RUN /tools/record_cmp.sh      # comparisons and and/or: what each test observed (run it twice, into rec/ and rec2/)
 python3 tools/build_maps.py sqlglot sample/tests.json . rec/iso2 rec/seq/forward.json rec/seq/reverse.json
 python3 tools/build_attr_maps.py sqlglot sample/tests.json . rec/attrs
-python3 tools/build_cmp_maps.py sample/tests.json . rec/cmp
+python3 tools/build_cmp_maps.py sample/tests.json . rec/cmp rec2/cmp
 ```
 
 `build_cmp_maps.py` also writes `maps/bool/` (what each test observed at every `and`/`or`).

@@ -196,9 +196,9 @@ Details that keep this honest:
   that case is not narrowed.
 - Chained comparisons (`a < b < c`) are not recorded and not narrowed.
 - The map is the union of independent runs: every test alone in a fresh process (child
-  processes included), plus the whole suite in normal and in reversed order (Python
-  randomises string hashing per process, which can change the order in which a set is
-  walked, so the three runs do not all see the same order). A test whose own run failed under the recorder is
+  processes included), plus the whole suite in normal and in reversed order, and all of
+  that done twice (Python randomises string hashing per process, which can change the
+  order in which a set is walked; the second pass changed two entries). A test whose own run failed under the recorder is
   never narrowed.
 - The recording was made with the same Python version as the image, so the positions
   (line, column) of comparisons in the syntax tree match what the selector computes.
