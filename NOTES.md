@@ -289,6 +289,7 @@ real tests are then run on each patch to learn which fail.
 | Class-attribute and lambda rules | full suite | 26 | 19 | 0 |
 | Dialect-specific modules | only the tests that import the patched module (`tools/fast_gt.py`): no other test can be affected | 287 | 191 | 0 |
 | Dialect, executor and optimizer modules, and test files | importers only | 182 | 139 | 0 |
+| Hand-made unusual kinds (`tools/gen_special.py`): test methods added, removed, renamed or skipped; `setUp` added; shared test helpers edited or deleted; new test files, modules, directories, `conftest.py`; binary fixtures changed or deleted; renamed fixtures, test files and modules; mode-only changes; files outside the package; `pyproject.toml`; package `__init__.py` | full suite | 42 | 20 | 0 |
 
 In the third set the selector chose 25,242 tests in total where "every importer" would be
 94,215. One patch there turned a loop infinite and exhausted memory, killing the test
