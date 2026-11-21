@@ -178,6 +178,11 @@ the class or module level of a test file selects every test that imports it (all
 the file, and for `tests/dialects/test_dialect.py` every dialect test, because they all
 import its `Validator`).
 
+One refinement for test classes: a **new method named `test_*`** is a new test that pytest
+collects; no existing test can notice it, so it selects nothing. A **removed** method
+selects whoever ran it (for a test method, the test that no longer exists). A new method
+with any other name could override a helper or `setUp`, so it selects the whole file.
+
 A non-Python file (`.sql` fixtures, `.csv.gz` data): the tests during which the file was
 opened.
 

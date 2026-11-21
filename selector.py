@@ -498,7 +498,8 @@ def _scope_signature(function):
 class Diff:
     """What a Python file change amounts to, in terms of the pinned file's lines."""
 
-    def __init__(self):
+    def __init__(self, test_file=False):
+        self.test_file = test_file  # the file is a pytest test module (tests/**/test_*.py)
         self.whole_module = False  # statements added or removed at module or class level
         self.statements = []  # (first, last) line ranges of statements whose own code changed
         self.functions = []  # (first, last) whole-definition ranges of functions changed structurally
@@ -595,6 +596,46 @@ def _only_constant_defaults_differ(a, b):
     return True
 
 
+def _diff_test_class(old_body, new_body, diff, old_blocks, new_blocks, pairs, owner):
+    """Methods were added to or removed from a class in a test file.
+
+    A new method named test_* is a new test: pytest collects it, and no existing test can
+    notice it. A removed method selects whoever ran it (for a test method, that test, which
+    no longer exists). Methods present on both sides are compared as usual. Anything else
+    (other statements changed, a new method with another name, which could override a
+    helper) is not handled here and the caller selects every test importing the module."""
+    def split(body):
+        methods, other = {}, []
+        for statement in body:
+            if isinstance(statement, _DEFS):
+                if statement.name in methods:
+                    return None, None
+                methods[statement.name] = statement
+            else:
+                other.append(_dump(statement))
+        return methods, other
+
+    old_methods, old_other = split(old_body)
+    new_methods, new_other = split(new_body)
+    if old_methods is None or new_methods is None or old_other != new_other:
+        return False
+    if any(not name.startswith("test_") for name in new_methods if name not in old_methods):
+        return False
+    for name, a in old_methods.items():
+        b = new_methods.get(name)
+        if b is None:
+            diff.functions.append(_function_body_range(a))
+            diff.reasons.append("test class method %s removed" % name)
+        elif (_touches(a, old_blocks) or _touches(b, new_blocks)) and _dump(a) != _dump(b):
+            diff.changed_top.append(b)
+            _diff_statement(a, b, None, diff, old_blocks, new_blocks, pairs, owner)
+    for name, b in new_methods.items():
+        if name not in old_methods:
+            diff.changed_top.append(b)
+            diff.reasons.append("new test method %s" % name)
+    return True
+
+
 def _runs(statement):
     """False for statements that execute nothing (and so never show up in a recording)."""
     if isinstance(statement, (ast.Pass, ast.Global, ast.Nonlocal)):
@@ -646,8 +687,10 @@ def _diff_reshaped_body(old_body, new_body, diff):
 def _diff_bodies(old_body, new_body, function, diff, old_blocks, new_blocks, pairs, owner=None):
     if len(old_body) != len(new_body) or any(type(a) is not type(b) for a, b in zip(old_body, new_body)):
         if function is None:
-            diff.whole_module = True
-            diff.reasons.append("statements added or removed at module or class level")
+            if not (diff.test_file and owner and _diff_test_class(
+                    old_body, new_body, diff, old_blocks, new_blocks, pairs, owner)):
+                diff.whole_module = True
+                diff.reasons.append("statements added or removed at module or class level")
         elif not _diff_reshaped_body(old_body, new_body, diff):
             diff.functions.append(_function_body_range(function))
             diff.reasons.append("statements added or removed in %s" % function.name)
@@ -894,7 +937,7 @@ def _parse_chunk(lines, first, last, wrapped):
     return statements
 
 
-def diff_python(old_text, new_text, old_blocks, new_blocks, index=None):
+def diff_python(old_text, new_text, old_blocks, new_blocks, index=None, test_file=False):
     """Compare the pinned and patched source. Returns a Diff, or None when the patched file
     is not valid Python.
 
@@ -905,7 +948,7 @@ def diff_python(old_text, new_text, old_blocks, new_blocks, index=None):
     on its own into exactly one statement, the rest of the file parses as before. If it
     does not, we fall back to parsing the whole file.
     """
-    diff = Diff()
+    diff = Diff(test_file)
     pairs = []
     new_tree = None
     chunk = _find_chunk(index, old_blocks)
@@ -989,7 +1032,8 @@ def select_python(change, maps, notes):
         raise RunEverything("encoding declaration")
     # Tests during which repository code read this file as data see any change to its text.
     bits = maps.readers(path)
-    diff = diff_python(old_text, new_text, old_blocks, new_blocks, maps.index(path))
+    is_test_module = path.startswith("tests/") and path.rsplit("/", 1)[-1].startswith("test_")
+    diff = diff_python(old_text, new_text, old_blocks, new_blocks, maps.index(path), is_test_module)
     if diff is None:
         notes.append("%s no longer compiles: every test importing it" % path)
         return bits | maps.importers(path)
