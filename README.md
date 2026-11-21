@@ -31,14 +31,17 @@ patches are.
 ```sh
 git clone https://github.com/tobymao/sqlglot && git -C sqlglot checkout eb11aec4be8cb2122afe713a4816662c3f0fb2fa
 docker build -t br-lab -f tools/lab.Dockerfile .
-docker run --rm --network none -v $PWD/sqlglot:/src:ro -v $PWD/tools:/tools:ro \
-  -v $PWD/rec:/out -v $PWD/sample/tests.json:/data/tests.json:ro br-lab /tools/record_all.sh
-python3 tools/build_maps.py sqlglot sample/tests.json . rec/iso2
+RUN="docker run --rm --network none -v $PWD/sqlglot:/src:ro -v $PWD/tools:/tools:ro -v $PWD/rec:/out -v $PWD/sample/tests.json:/data/tests.json:ro br-lab"
+$RUN /tools/record_all.sh      # every test alone: lines, started functions, files
+$RUN /tools/record_suite.sh    # whole suite in one process, normal and reversed order
+$RUN /tools/record_attrs.sh    # every test alone: class attributes read
+python3 tools/build_maps.py sqlglot sample/tests.json . rec/iso2 rec/seq/forward.json rec/seq/reverse.json
+python3 tools/build_attr_maps.py sqlglot sample/tests.json . rec/attrs
 ```
 
-`record_all.sh` runs every test alone, in a fresh process, under the labelling image and
-package versions (`requirements.lock`), with a recorder loaded into every Python process
-the test starts.
+The recordings run each test under the labelling image and package versions
+(`requirements.lock`), with a recorder loaded into every Python process the test starts.
+See [tools/README.md](tools/README.md).
 
 ## Try it
 
