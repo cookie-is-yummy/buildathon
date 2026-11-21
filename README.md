@@ -9,7 +9,9 @@ them over workers.
 paragraph: the selector rebuilds the patched file from the pinned source, compares the
 syntax trees to find exactly which statements changed, and asks maps recorded at the
 pinned commit which tests execute those statements, import that module or open that file.
-When it cannot reason about a change, it runs every test.
+When it cannot reason about a change, it runs every test. For the slowest integration
+test it goes one step further: it repeats that test's sqlglot calls on the patched code
+(`replay.py`) and keeps the test unless the outcome is identical to the pinned one.
 
 There is no table from patches, or from kinds of edit, to tests. The maps describe the
 pinned commit only: which test executes which line, imports which module, opens which
@@ -23,8 +25,9 @@ same whatever the patches are.
 | Path | What it is |
 | --- | --- |
 | `selector.py`, `run.py` | The program the image runs. Standard library only. |
+| `replay.py` | Started by the selector for some commits: repeats the sqlglot calls of the slow executor test on the patched code and compares fingerprints of what they return. Runs the pinned sqlglot. |
 | `maps/` | Recordings of the pinned commit, as plain JSON (see `tools/build_maps.py`). |
-| `pinned/` | The Python files (and two config files) of sqlglot at the pinned commit. The selector needs their text to rebuild a patched file. |
+| `pinned/` | The Python files (and two config files) of sqlglot at the pinned commit. The selector needs their text to rebuild a patched file. Also the TPC-DS fixture files (`tests/fixtures/optimizer/tpc-ds/`) that `replay.py` reads. |
 | `tools/` | How the maps were made, and the local evaluation harness. Not used at run time. |
 | `Dockerfile`, `Makefile`, `score.py`, `SCORING.md`, `sample/` | From the organisers' starter kit. |
 
@@ -41,6 +44,12 @@ $RUN /tools/record_cmp.sh      # comparisons and and/or: what each test observed
 python3 tools/build_maps.py sqlglot sample/tests.json . rec/iso2 rec/seq/forward.json rec/seq/reverse.json
 python3 tools/build_attr_maps.py sqlglot sample/tests.json . rec/attrs
 python3 tools/build_cmp_maps.py sample/tests.json . rec/cmp rec2/cmp
+$RUN /tools/record_phase.sh    # the slow executor test: which lines run inside its three sqlglot calls
+make build                     # the entry image; the next step runs inside it
+docker run --rm --network none -v $PWD/tools:/tools:ro -v $PWD/rec:/out blast-radius-entry \
+    python -B -s /tools/record_replay.py /app/pinned /out/replay.json
+python3 tools/build_replay_maps.py rec/phase rec/replay.json .
+make build                     # again, now with maps/replay.json
 ```
 
 The recordings run each test under the labelling image and package versions
@@ -59,13 +68,17 @@ python3 tools/evaluate.py sample sample/answers.json   # same without Docker, wi
 - **sqlglot** (MIT, © Toby Mao). `pinned/` holds unmodified copies of its Python source
   files, `pyproject.toml` and `setup.cfg` at the pinned commit, with its licence in
   `pinned/LICENSE`. The maps in `maps/` were recorded by running its test suite.
+- **python-dateutil** 4.0.0 (Apache 2.0 / BSD) and **mypy_extensions** 1.2.0 (MIT) are
+  installed into the image from PyPI. sqlglot imports them when they are present, as they
+  are where the tests run, and `replay.py` runs the pinned sqlglot. The selector itself
+  does not use them.
 - **coverage.py** (Apache 2.0, © Ned Batchelder and contributors) recorded the executed
   lines. It is used only by `tools/`, never in the image.
 - **pytest** (MIT) ran the tests while recording. Used only by `tools/`.
 - The starter kit files (`score.py`, `SCORING.md`, `Makefile`, `sample/`,
   `requirements.lock`) come from the organisers.
 
-The image itself uses only the Python standard library.
+`selector.py` uses only the Python standard library.
 
 ## Licence
 

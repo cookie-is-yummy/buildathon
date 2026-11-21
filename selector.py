@@ -25,6 +25,9 @@ WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 # Wall-clock budget for the whole batch. Past it, every remaining commit runs all tests.
 TIME_BUDGET_SECONDS = float(os.environ.get("BLAST_BUDGET", "100"))
+# Fill spare room on workers with further tests at no cost (see fill). BLAST_FILL=0 turns
+# it off, which the evaluation does: it must see what the rules alone select.
+FILL = os.environ.get("BLAST_FILL", "1") != "0"
 
 # A new file with one of these names can change how pytest or Python itself behaves.
 GLOBAL_FILE_NAMES = {
@@ -71,6 +74,12 @@ class Maps:
         self._impure = None
         self._index = None
         self.all_bits = (1 << len(map_ids)) - 1
+        self.bit_of = {tid: bit for bit, tid in enumerate(map_ids)}
+        # True: answer as if the comparison and and/or recordings did not exist
+        self.plain = False
+        # Set by select_python for the Replayer: (path, new text, line ranges of changed
+        # statements inside functions, tests selected for any other reason)
+        self.trace = None
 
     def index(self, path):
         """Line ranges of the pinned file's top-level statements and class-body statements."""
@@ -188,6 +197,8 @@ class Maps:
         """For the and/or expression at that position: [(operands evaluated, operands true,
         tests)], one per distinct outcome seen (operands evaluated < 0: an evaluation that
         did not finish). None when unknown."""
+        if self.plain:
+            return None
         table = self._outcomes.get(path)
         if table is None:
             name = os.path.join(MAPS, "bool", path.replace("/", "__") + ".json")
@@ -214,6 +225,8 @@ class Maps:
         per distinct outcome seen. Bit i of `known`: the answer of operator i (numbered as
         in _COMPARISONS) for the two operands is known; bit i of `true`: it is True.
         None when the comparison is unknown."""
+        if self.plain:
+            return None
         table = self._comparisons.get(path)
         if table is None:
             name = os.path.join(MAPS, "cmp", path.replace("/", "__") + ".json")
@@ -1332,9 +1345,15 @@ def select_python(change, maps, notes):
         return bits | maps.importers(path)
     for first, last in diff.functions:
         bits |= maps.started(path, first, last)
+    other = bits  # selected for a reason other than "executes these lines of a function"
+    ranges = list(diff.statements)
     for first, last in diff.statements:
         bits |= maps.covering(path, first, last)
     for in_lambda, first, last, sites in diff.swaps:
+        if in_lambda:
+            other |= maps.started(path, first, last)
+        else:
+            ranges.append((first, last))
         # Unaffected: a test that evaluated every changed comparison and never saw the new
         # operator give a different result. Its run is then step for step the same. A test
         # that executes the statement but was not seen evaluating the comparison stays in.
@@ -1381,15 +1400,18 @@ def select_python(change, maps, notes):
                         differs |= tests
             bits |= (executing & ~(evaluated & ~differs)) | differs
     for line in diff.lambdas:
-        bits |= maps.started(path, line, line)
+        found = maps.started(path, line, line)
+        bits |= found
+        other |= found
     for qualname, name, entries_removed, lines in diff.attributes:
         found = maps.attribute_readers(path, qualname, name)
         if found is None or (entries_removed and found[1]):
             # Not instrumented, or a hook that runs when classes are created reads it and
             # might need an entry that was removed: everyone who runs the assignment.
-            bits |= maps.covering(path, lines[0], lines[1])
-        else:
-            bits |= found[0]
+            found = (maps.covering(path, lines[0], lines[1]),)
+        bits |= found[0]
+        other |= found[0]
+    maps.trace = (path, new_text, ranges, other)
     notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s), %d operator(s) %s" % (
         path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes), len(diff.swaps),
         "; ".join(diff.reasons[:2])))
@@ -1579,14 +1601,192 @@ def select_change(change, maps, notes):
     return maps.readers(path) | maps.infra_readers(path) | maps.importers(path)
 
 
-def select(patch_text, maps, notes):
+def select(patch_text, maps, notes, replayer=None):
     if not patch_text.strip():
         notes.append("empty patch: nothing changed")
         return 0
     bits = 0
+    other = 0    # tests selected for a reason the replayer cannot follow
+    traced = []  # (path, new text, line ranges) of Python files changed inside functions
     for change in parse_patch(patch_text):
-        bits |= select_change(change, maps, notes)
+        maps.trace = None
+        found = select_change(change, maps, notes)
+        bits |= found
+        if maps.trace is None:
+            other |= found
+        else:
+            other |= maps.trace[3]
+            traced.append(maps.trace[:3])
+    if replayer is not None and traced:
+        bits = replayer.narrow(bits, other, traced, maps, notes)
     return bits
+
+
+# --------------------------------------------------------------------------- replay
+
+REPLAY_MAP = os.path.join(MAPS, "replay.json")
+REPLAY_BASELINE = os.path.join(HERE, "baseline.json")
+REPLAY_PROGRAM = os.path.join(HERE, "replay.py")
+# Replaying is worth its CPU seconds only if they are clearly fewer than what dropping
+# the test would save: replay when (estimated CPU) <= REPLAY_WORTH * (seconds saved).
+REPLAY_WORTH = 0.6
+REPLAY_TOTAL_SECONDS = float(os.environ.get("BLAST_REPLAY_TOTAL", "45"))  # wall clock for all replays of one run
+REPLAY_START_SECONDS = 0.6   # starting Python and importing the pinned sqlglot
+
+
+class Replayer:
+    """Decides, for one slow test, whether a patch can change its result by repeating
+    the test's sqlglot calls on the patched code (see replay.py for the argument).
+
+    Only used when everything the patch changes that the test executes is a statement
+    inside a function, and the test executes that statement inside the replayed calls
+    and nowhere else. The map (maps/replay.json, built from recordings of the pinned
+    commit) lists those lines and, per line, the queries that execute it."""
+
+    def __init__(self, maps, duration):
+        self.duration = duration
+        table = json.load(open(REPLAY_MAP))
+        baseline = json.load(open(REPLAY_BASELINE))
+        self.bit = 1 << maps.bit_of[table["test"]]
+        self.number = maps.number_of_bit[maps.bit_of[table["test"]]]
+        self.seconds = table["seconds"]  # CPU per query: "full" executed, "plan" up to the plan
+        # line -> (queries that execute it, queries that execute it while running a plan)
+        self.lines = {path: {line: (int(every, 16), int(running, 16)) for line, every, running in rows}
+                      for path, rows in table["files"].items()}
+        self.baseline = baseline
+        self.unstable = {int(q) for q in baseline["unstable"]}
+        if len(baseline["full"]["0"]) != len(self.seconds["full"]):
+            raise ValueError("baseline and map disagree")
+        self.spent = 0.0
+
+    def narrow(self, bits, other, traced, maps, notes):
+        if not bits & self.bit or other & self.bit or bits == maps.all_bits:
+            return bits
+        every = running = 0
+        for path, _, ranges in traced:
+            eligible = self.lines.get(path, {})
+            for first, last in ranges:
+                for line in range(first, last + 1):
+                    if maps.covering(path, line, line) & self.bit:
+                        if line not in eligible:
+                            return bits  # the test also executes it outside the calls
+                        every |= eligible[line][0]
+                        running |= eligible[line][1]
+        count = len(self.seconds["full"])
+        full = [q for q in range(count) if running >> q & 1]
+        plan = [q for q in range(count) if every >> q & 1 and not running >> q & 1]
+        if not full and not plan or self.unstable.intersection(full + plan):
+            return bits
+        # Seed 0 for all of them; another seed only for the queries whose pinned behaviour
+        # differs under it (the second half of a "plan" fingerprint is only the order of
+        # the tables, see replay.py), and each such behaviour once.
+        def pinned(seed, kind, query):
+            value = self.baseline[kind][seed][str(query)]
+            return value.split(":")[0] if kind == "plan" else value
+
+        runs = [("0", plan, full)]
+        seen = set()
+        for seed in sorted(self.baseline["full"], key=int):
+            plan_again = [q for q in plan if pinned(seed, "plan", q) != pinned("0", "plan", q)]
+            full_again = [q for q in full if pinned(seed, "full", q) != pinned("0", "full", q)]
+            key = tuple((q, pinned(seed, "plan", q)) for q in plan_again) + tuple((q, pinned(seed, "full", q)) for q in full_again)
+            if key and key not in seen:
+                seen.add(key)
+                runs.append((seed, plan_again, full_again))
+        estimate = sum(REPLAY_START_SECONDS + sum(self.seconds["full"][q] for q in f) + sum(self.seconds["plan"][q] for q in p)
+                       for _, p, f in runs)
+        saved = self.saving(bits, maps)
+        if estimate > REPLAY_WORTH * saved or self.spent + estimate > REPLAY_TOTAL_SECONDS:
+            notes.append("replay not worth it (%.1f s for %d+%d queries, %.1f s to save)" % (estimate, len(plan), len(full), saved))
+            return bits
+        started = time.monotonic()
+        try:
+            same = self.run(runs, traced, estimate)
+        except Exception as error:
+            same = False
+            notes.append("replay failed: %r" % (error,))
+        self.spent += time.monotonic() - started
+        notes.append("replay of %d+%d queries (%.1f s): %s" % (
+            len(plan), len(full), time.monotonic() - started, "same, slow executor test dropped" if same else "differs"))
+        return bits & ~self.bit if same else bits
+
+    def saving(self, bits, maps):
+        """Commit cost with the test minus commit cost without it, in seconds."""
+        costs = []
+        for chosen in (bits, bits & ~self.bit):
+            workers = split(maps.numbers(chosen), self.duration)
+            costs.append(max(sum(self.duration[n] for n in w) for w in workers) + WORKER_COST_MS * len(workers) if workers else 0)
+        return (costs[0] - costs[1]) / 1000.0
+
+    def run(self, runs, traced, estimate):
+        import shutil
+        import subprocess
+        import tempfile
+
+        directory = tempfile.mkdtemp(prefix="replay", dir="/tmp")
+        try:
+            patched = []
+            for index, (path, text, _) in enumerate(traced):
+                if not path.startswith("sqlglot/"):
+                    return False
+                name = os.path.join(directory, "%d.py" % index)
+                with open(name, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(text)
+                patched.append("%s=%s" % (path, name))
+            for seed, plan, full in runs:
+                # cheap ones first: a difference ends the run
+                plan = sorted(plan, key=lambda q: self.seconds["plan"][q])
+                full = sorted(full, key=lambda q: self.seconds["full"][q])
+                done = subprocess.run(
+                    [sys.executable, "-B", "-s", REPLAY_PROGRAM, "run", PINNED, REPLAY_BASELINE, seed,
+                     ",".join(str(q) for q in plan) or "-", ",".join(str(q) for q in full) or "-"] + patched,
+                    env={"PYTHONHASHSEED": seed, "HOME": "/tmp", "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
+                    cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=8 + 2.5 * estimate)
+                if done.returncode != 0 or done.stdout.strip() != b"same":
+                    return False
+            return True
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def wider(patch_text, maps):
+    """Tests that the plain rules would select: everyone who executes a changed statement,
+    without the narrowing by recorded comparison and and/or outcomes and without the
+    replay; and after them, everyone who imports a changed Python file. Used only to fill
+    spare room on workers that run anyway (see fill)."""
+    maps.plain = True
+    try:
+        first = select(patch_text, maps, [])
+    finally:
+        maps.plain = False
+    second = 0
+    for change in parse_patch(patch_text):
+        if change.status == "M" and change.old.endswith(".py") and change.old in maps.tracked:
+            second |= maps.importers(change.old)
+    return first, second
+
+
+def fill(workers, groups, duration):
+    """Add tests to workers without making the commit cost more: never a new worker,
+    never beyond the load of the busiest one. A test that is cheap to run next to a
+    slow one costs nothing, and running it can only help."""
+    workers = [list(w) for w in workers]
+    if not workers:
+        return workers
+    loads = [sum(duration[n] for n in w) for w in workers]
+    limit = max(loads)
+    have = {n for w in workers for n in w}
+    for group in groups:
+        for n in sorted(group, key=lambda n: (-duration[n], n)):
+            if n in have:
+                continue
+            j = loads.index(min(loads))
+            if loads[j] + duration[n] <= limit:
+                workers[j].append(n)
+                loads[j] += duration[n]
+                have.add(n)
+    return workers
 
 
 # --------------------------------------------------------------------------- splitting
@@ -1635,6 +1835,13 @@ def main():
     except Exception as error:  # without maps the only safe answer is everything
         log("maps failed to load:", repr(error))
 
+    replayer = None
+    try:
+        if maps is not None and os.path.exists(REPLAY_BASELINE):
+            replayer = Replayer(maps, duration)
+    except Exception as error:  # without it the slow test is simply never dropped this way
+        log("replay unavailable:", repr(error))
+
     for commit in commit_ids:
         workers = run_all
         notes = []
@@ -1645,7 +1852,7 @@ def main():
                 raise RunEverything("time budget")
             with open(os.path.join(commits_dir, commit + ".patch"), encoding="utf-8", newline="") as handle:
                 patch_text = handle.read()
-            bits = select(patch_text, maps, notes)
+            bits = select(patch_text, maps, notes, replayer)
             if bits == maps.all_bits:
                 numbers = everything
             else:
@@ -1653,7 +1860,15 @@ def main():
                 if numbers and maps.unknown:
                     numbers = sorted(set(numbers) | set(maps.unknown))
             workers = split(numbers, duration) if len(numbers) < len(everything) else run_all
-            log(commit, len(numbers), "tests;", " | ".join(notes))
+            added = 0
+            if FILL and workers and len(numbers) < len(everything):
+                try:
+                    filled = fill(workers, [maps.numbers(group) for group in wider(patch_text, maps)], duration)
+                    added = sum(len(w) for w in filled) - len(numbers)
+                    workers = filled
+                except Exception as error:
+                    log(commit, "no filling:", repr(error))
+            log(commit, len(numbers), "tests (+%d in spare room);" % added, " | ".join(notes))
         except RunEverything as reason:
             log(commit, "ALL:", reason)
         except BaseException as error:  # never let one commit cost the whole run

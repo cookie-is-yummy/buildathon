@@ -13,7 +13,9 @@ this repository**, and the selector reads none.
 | `site_seq/`, `record_suite.sh` | The whole suite in one process (normal and reversed order) with one coverage context per test. |
 | `site_attrs/sitecustomize.py`, `record_attrs.sh` | Which tests read which class attribute. |
 | `site_cmp/`, `record_cmp.sh` | What each test observes when it evaluates a comparison (how the operands relate) or an `and`/`or` (which operands were evaluated and true). Every test alone, plus the whole suite in both orders. |
-| `build_maps.py`, `build_attr_maps.py`, `build_cmp_maps.py` | Turn the recordings into `maps/` and copy the pinned sources into `pinned/`. |
+| `site_replay/`, `record_phase.sh` | For the slow executor test: which lines it executes inside its three sqlglot calls and which outside (all processes). |
+| `record_replay.py` | Run inside the entry image: which lines each TPC-DS query executes when `replay.py` repeats those calls, alone and after other queries, and the CPU each query takes. |
+| `build_maps.py`, `build_attr_maps.py`, `build_cmp_maps.py`, `build_replay_maps.py` | Turn the recordings into `maps/` and copy the pinned sources into `pinned/`. |
 
 ## Checking the selector
 

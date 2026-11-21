@@ -28,6 +28,10 @@ before the competition we recorded, at the pinned commit, what every test uses:
 - for every **`and`/`or` expression** it evaluates, which operands were reached and
   which of them were true.
 
+For one slow test there is one more step, after the lookup: the image repeats the quick,
+deterministic part of that test on the patched code and compares the outcome with the
+pinned one (see "Replaying the slow executor test").
+
 These recordings ("maps") depend only on the pinned commit. They are the same whatever
 patches arrive. At run time the selector works out *what a patch changes* and looks up
 *who uses that*.
@@ -259,6 +263,76 @@ selected. The value is on other patches of these kinds: over every possible one 
 sqlglot the rules cut the cost by roughly 3% (`and` -> `or`), 15% (`or` -> `and`) and
 25-40% (later operand).
 
+### Replaying the slow executor test (replay.py)
+
+Where the time goes: three tests take 57 of the suite's 103 seconds. The one that matters
+most is `tests/test_executor.py::TestExecutor::test_execute_tpcds` (21.5 s). It runs 57
+TPC-DS queries through the optimizer and sqlglot's own Python executor and compares the
+rows with DuckDB. It therefore executes a large part of the optimizer, planner and
+executor, and gets selected for about one code change in six. Over every possible
+single-token change in sqlglot, commits that select this test carry two thirds of the
+total cost, and for about half of them the test does not actually fail. The rules above
+cannot tell which half: the test does execute the changed statement.
+
+But most of those 21 seconds are not sqlglot. The test starts worker processes, loads CSV
+tables and runs DuckDB. What it does *with sqlglot* is three calls per query:
+
+    parent    parse_one(sql)                   -> the expression, pickled to a worker
+    worker    mp_execute(expression, meta)     -> optimize, plan, execute over the tables
+    parent    transpile(sql, write="duckdb")   -> the SQL text DuckDB is given
+
+and these are quick: 17 CPU-seconds for all queries together, 0.2 s for a typical one.
+They are also the only way sqlglot code can reach the verdict. So for this one test the
+selector can do better than reason about it: it can **repeat those calls on the patched
+code** and look at what they return.
+
+`replay.py` does exactly that, in the image, for chosen queries: same query text, same
+arguments, the tables built the way the test builds them, the same pickling in between.
+It takes a fingerprint of everything the calls return (the object graphs are walked
+completely, without calling any method). The fingerprints of the pinned code are computed
+when the image is built. The selector drops the test only when **all** of this holds:
+
+1. Everything in the patch that the test executes is a statement inside a function, in a
+   file under `sqlglot/` (no class-level or module-level code, no test file, no fixture).
+2. The test executes each of those statements inside the three calls and nowhere else.
+   A recording of the real test, in all its processes, says for every line whether it
+   ran inside or outside the calls (`tools/site_replay`, three runs, identical).
+3. Which queries execute the statement does not depend on what ran earlier in the
+   process. Every query was recorded alone in a fresh process and as part of one long
+   run; a line where the two differ (a table built on first use, a cache) is left out.
+4. The replay of every query that executes one of the statements gives the pinned
+   fingerprint.
+
+Then each of the test's steps receives the same values as at the pinned commit, and the
+steps that are not replayed (comparing with DuckDB) run the same code on the same input.
+The test ends as before: it passes. Any difference, exception or time-out keeps it.
+
+Two refinements:
+
+- **Up to the plan.** Executing the plan over the data is the expensive step. For a
+  query in which the patched statements run only before that step, comparing what goes
+  *into* it (the plan and the tables) is enough, at a tenth of the cost. The recording
+  keeps the two apart per line and per query.
+- **Hash seeds.** One query is parsed with its modifiers in an order that follows the
+  iteration order of a set, so its fingerprint depends on Python's hash seed. Baselines
+  exist for six seeds; the replay runs once per distinct pinned behaviour of the queries
+  involved (normally once, twice if that query is among them), with the seed fixed.
+
+It is only attempted when it pays: the estimated CPU (recorded per query) must be at most
+half of what dropping the test would save, and all replays of a run share a 45-second
+budget. The CPU seconds are part of the score, so they are in the results table.
+
+The replay needs sqlglot to behave as it does where the tests run. sqlglot imports two
+third-party packages if present (`dateutil` for date arithmetic, `mypy_extensions`); the
+image installs both at the versions of `requirements.lock`. If the baseline cannot be
+built, the selector works as before, without this step.
+
+What this argument assumes, plainly: that the three calls are deterministic given their
+arguments, and that they leave nothing behind in the process that later steps read
+without going through the changed statement. Point 3 checks the second assumption as far
+as coverage can show it. It is checked end to end by running the real test on patched
+trees where the replay said "same" (see the left-out-tests check).
+
 ### Tests that inspect code instead of running it
 
 `tests/test_typing.py` reads the source of every `sqlglot/typing/*.py` module and compares
@@ -334,6 +408,15 @@ nothing. The evidence is the recording of every file opened during the whole sui
 3. **Split** the selected tests over k = 1..8 workers (longest test first onto the least
    loaded worker) and keep the k with the smallest "largest load + 2 s x k", in whole
    milliseconds as SCORING.md defines.
+4. **Fill spare room.** A commit costs its busiest worker. Once the split is fixed, the
+   other workers can take more tests for free as long as none becomes busier than the
+   busiest. That room is filled, first with the tests the narrowing rules above removed
+   (comparison and `and`/`or` outcomes, replay), then with tests that import a changed
+   Python file. It never adds a worker and never raises the largest load, so the score
+   cannot change; if one of the narrowing rules is ever wrong about a cheap test, the
+   test may still be run. It is no substitute for the rules being right: a commit that
+   selects nothing has no room, and the slow test never fits. The evaluation runs with
+   this switched off (`BLAST_FILL=0`), so that it measures the rules alone.
 
 ## Safety nets
 
@@ -404,6 +487,16 @@ Listed from most to least worrying.
 
 | + `and`/`or` swap rule and later-operand rule | 117.425 | 0 | 0.10 | all five sets: 0 misses (mixed set 1531.1 s -> 1504.8 s); left-out-tests checks below |
 
+| + replay of the slow executor test; spare room on workers filled | 117.425 | 0 | 1.03 | mixed set 1504.8 s -> 1448.3 s, 0 misses; the other sets unchanged, 0 misses; replay check below |
+
+The board score of the previous step was 193.3 s against 117.4 s on the sample: the
+board's commits happen to select the slow executor test more often. Over every possible
+single-token change (one file drawn at random, then one place in it), the expected cost
+of a code commit was 7.2 s, two thirds of it from commits that select that test. That is
+what the replay step is aimed at. On the sample it costs 0.9 s of CPU and saves nothing
+(the one commit it looks at really fails the test; the replay says "differs" after
+0.7 s).
+
 By kind on the sample at the last step: code 89.3 s (16 commits; the best possible is
 79.1 s), comment 0.0 s (3), fixture 17.9 s (8; best possible 17.9), multi 10.2 s (3; best
 possible 10.2). "Best possible" means selecting exactly the failing tests. Before the
@@ -454,9 +547,19 @@ Every one of them must pass. A single failure means the rule or the recording is
 | Comparison operator swapped, shipped maps, a fresh draw of patches | 400 | 43,713 | 0 |
 | `and` <-> `or` (200 each way) | 400 | 39,876 | 0 |
 | Later operand: the operand replaced by an expression that raises as soon as it is evaluated | 400 | 51,721 | 0 |
+| Replay of the slow executor test said "same": the real test run on the patched tree | 46 | 46 | 0 |
 
 For the later-operand rule the replacement is the harshest possible change: any left-out
 test that evaluates the operand even once crashes.
+
+The replay row comes from a different draw: 140 random single-token changes (`and`/`or`,
+comparison, `True`/`False`, number + 1, `not` removed) on lines the replay map covers, one
+file at random and then one place in it. Run through the image: 116 replays attempted,
+46 "same", 70 "differs" (a difference ends a replay early: 1.1 s on average, against
+4.3 s when everything is the same), 19 judged not worth the CPU, 5 not eligible after
+all. All 46 were then run for real (45 CPU-seconds each): 46 pass. 46 cases cannot show
+a failure rate below a few percent, so this check is weaker than the three above; what
+carries the rule is the argument in "Replaying the slow executor test".
 
 History, so the numbers are not read as more than they are. The comparison check was
 run with the first recording. After the recorder was rewritten (see "Mistakes"), the
