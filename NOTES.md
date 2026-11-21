@@ -143,6 +143,17 @@ creation hook reads the attribute) entries removed from a literal. Anything else
 example a changed argument of a call such as `re.compile(...)`, could raise while the
 module is imported and fail every importer, so it falls back to all importers.
 
+### Tests that inspect code instead of running it
+
+`tests/test_typing.py` reads the source of every `sqlglot/typing/*.py` module and compares
+the *bytecode* of the functions they register, without calling them. Line coverage cannot
+see that. The recording of opened files can: the test opens those files as data, so it is
+selected for any change to them (this is also why a comment in those files still selects
+one test: we cannot know the reader ignores comments). It compares against functions in
+the package's `__init__.py` too, which it never opens, so the rule is: **a test that opens
+some module of a package directory as data is selected for any code change in that
+directory.** A search of the pinned tests found no other test that inspects code objects.
+
 ### Function defaults
 
 If only constant default values of a function's parameters change, the header still runs

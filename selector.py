@@ -65,6 +65,7 @@ class Maps:
         self._tables = files
         self._lines = {}
         self._attrs = {}
+        self._siblings = {}
         self._index = None
         self.all_bits = (1 << len(map_ids)) - 1
 
@@ -89,6 +90,21 @@ class Maps:
     def readers(self, path):
         """Tests during which repository code (sqlglot or the tests) opened this file."""
         return self._get("data", path)
+
+    def sibling_readers(self, path):
+        """Tests during which repository code opened some Python file in the same directory
+        as data. A test that inspects the source or bytecode of a package's modules (one
+        compares functions across sqlglot/typing/*.py without calling them) depends on
+        every module of that package, including ones it does not open."""
+        directory = path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+        bits = self._siblings.get(directory)
+        if bits is None:
+            bits = 0
+            for other, value in self._tables["data"].items():
+                if other.endswith(".py") and other.startswith(directory) and "/" not in other[len(directory):]:
+                    bits |= int(value, 16)
+            self._siblings[directory] = bits
+        return bits
 
     def infra_readers(self, path):
         """Tests during which something else (pytest reading its config) opened it."""
@@ -977,6 +993,9 @@ def select_python(change, maps, notes):
     if diff is None:
         notes.append("%s no longer compiles: every test importing it" % path)
         return bits | maps.importers(path)
+    if diff.whole_module or diff.statements or diff.functions or diff.lambdas or diff.attributes:
+        # the code changed (not just comments): tests that inspect this package's modules
+        bits |= maps.sibling_readers(path)
     if diff.whole_module:
         notes.append("%s whole-module change (%s)" % (path, "; ".join(diff.reasons[:2])))
         return bits | maps.importers(path)
