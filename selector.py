@@ -74,6 +74,7 @@ class Maps:
         self._tables = files
         self._lines = {}
         self._attrs = {}
+        self._keys = {}
         self._siblings = {}
         self._comparisons = {}
         self._outcomes = {}
@@ -191,6 +192,27 @@ class Maps:
         if value.startswith("!"):
             return int(value[1:], 16), True
         return int(value, 16), False
+
+    def key_readers(self, path, qualname, name, positions):
+        """Tests that look up, in the dictionary assigned to class attribute `name` in the
+        body of class `qualname`, any of the entries whose keys stand at `positions`
+        ((line, column) in the pinned file), or do something that shows every value. None
+        when the map does not cover the dictionary or one of the entries."""
+        table = self._keys.get(path)
+        if table is None:
+            file_name = os.path.join(MAPS, "keys", path.replace("/", "__") + ".json")
+            table = json.load(open(file_name)) if os.path.exists(file_name) else {"sets": [], "tables": {}}
+            self._keys[path] = table
+        entries = table["tables"].get(qualname, {}).get(name)
+        if entries is None:
+            return None
+        bits = 0
+        for line, column in positions:
+            index = entries.get("%d:%d" % (line, column))
+            if index is None:
+                return None
+            bits |= int(table["sets"][index], 16)
+        return bits
 
     def _attributes(self, path):
         table = self._attrs.get(path)
@@ -579,6 +601,11 @@ class Diff:
         # (in a module/class level lambda?, first line, last line of the statement or the
         # lambda's line, [(line, column, old operator, new operator)])
         self.swaps = []
+        # class-level dictionaries of which only the values of some entries changed:
+        # (class qualname, attribute, [(line, column) of each changed entry's key],
+        #  names of functions called to make the new values, also fine as a whole-attribute
+        #  change?, (first, last) lines of the assignment)
+        self.entries = []
         self.docstrings = 0  # class or module docstrings whose text changed
         self.changed_top = []  # new-side module/class level statements that may differ
         self.reasons = []
@@ -873,6 +900,14 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
             return
         target = _assigned_name(a)
         if owner and target and target == _assigned_name(b) and _dump(getattr(a, "annotation", None) or a.targets[0]) == _dump(getattr(b, "annotation", None) or b.targets[0]):
+            # One or more values of a dictionary display, keys untouched: only a test that
+            # looks up one of those keys can notice (maps/keys, see Maps.key_readers).
+            changed = _changed_entries(a.value, b.value)
+            if changed:
+                plain = _safe_value_change(a.value, b.value, False)
+                diff.entries.append((owner[0], target, changed[0], changed[1], plain, (a.lineno, a.end_lineno)))
+                diff.reasons.append("entries of class attribute %s.%s" % (owner[0], target))
+                return
             # Only a change that cannot make the class body itself fail at import is
             # narrowed to the attribute's readers: constants replaced by constants of the
             # same type, or entries removed from a literal.
@@ -1055,6 +1090,133 @@ def _safe_value_change(a, b, allow_removal):
             [(k and _dump(k), _dump(v)) for k, v in zip(b.keys, b.values)],
             [(k and _dump(k), _dump(v)) for k, v in zip(a.keys, a.values)])
     return _dump(a) == _dump(b)
+
+
+def _changed_entries(a, b):
+    """For two dictionary displays with the same keys in the same order that differ only
+    in the values of some entries, and only in ways that cannot fail or do anything else
+    when the class body runs: ([(line, column) of each changed entry's key], [names of
+    the functions those values call]). None otherwise.
+
+    A changed value may be a literal with constants replaced by constants of the same
+    type, or a call `f(...)` of a plain name with only such constants changed among its
+    arguments. For the call the caller must still check that `f` does nothing but build
+    and return a function (_closure_factory)."""
+    if not (isinstance(a, ast.Dict) and isinstance(b, ast.Dict)) or len(a.keys) != len(b.keys):
+        return None
+    positions, callees = [], []
+    for k1, k2, v1, v2 in zip(a.keys, b.keys, a.values, b.values):
+        if (k1 is None) != (k2 is None) or (k1 is not None and _dump(k1) != _dump(k2)):
+            return None
+        if _dump(v1) == _dump(v2):
+            continue
+        if k1 is None:
+            return None  # a changed `**spread`
+        if _safe_value_change(v1, v2, False) and not any(isinstance(n, (ast.Call, ast.Lambda)) for n in ast.walk(v1)):
+            positions.append((k1.lineno, k1.col_offset))
+            continue
+        if not (isinstance(v1, ast.Call) and isinstance(v2, ast.Call) and isinstance(v1.func, ast.Name)
+                and _dump(v1.func) == _dump(v2.func) and len(v1.args) == len(v2.args)
+                and [k.arg for k in v1.keywords] == [k.arg for k in v2.keywords]):
+            return None
+        for x, y in zip(v1.args + [k.value for k in v1.keywords], v2.args + [k.value for k in v2.keywords]):
+            if _dump(x) == _dump(y):
+                continue
+            if not (isinstance(x, ast.Constant) and isinstance(y, ast.Constant) and type(x.value) is type(y.value)):
+                return None
+        positions.append((k1.lineno, k1.col_offset))
+        callees.append(v1.func.id)
+    return (positions, callees) if positions else None
+
+
+_module_trees = {}
+
+
+def _module_tree(path):
+    if path not in _module_trees:
+        try:
+            _module_trees[path] = ast.parse(read_pinned(path))
+        except (OSError, SyntaxError, ValueError):
+            _module_trees[path] = None
+    return _module_trees[path]
+
+
+def _class_binds(path, qualname, name):
+    """Does the body of class `qualname` (or of a class around it) bind `name` itself? Then
+    the name means something else there than at module level."""
+    node = _module_tree(path)
+    for part in qualname.split("."):
+        if node is None:
+            return True
+        node = next((n for n in node.body if isinstance(n, ast.ClassDef) and n.name == part), None)
+        if node is None:
+            return True
+        for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if statement.name == name:
+                    return True
+            elif any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store) for n in ast.walk(statement)):
+                return True
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                return True
+    return False
+
+
+def _closure_factory(path, name, follow=True):
+    """True when `name`, as the pinned module at `path` sees it, is a function that does
+    nothing but define functions and return one of them (or a lambda): calling it at
+    import builds a function object and has no other effect, whatever its arguments."""
+    tree = _module_tree(path)
+    if tree is None:
+        return False
+    found = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)) and node.name == name:
+            found = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(n, ast.Name) and n.id == name for t in targets for n in ast.walk(t)):
+                found = node
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if (alias.asname or alias.name) == name:
+                    found = (node, alias.name)
+        elif isinstance(node, ast.Import):
+            if any((alias.asname or alias.name).split(".")[0] == name for alias in node.names):
+                found = node
+        elif not isinstance(node, (ast.Expr, ast.Pass)):
+            # an `if`, `try`, loop ... at module level could bind the name: give up on it
+            if any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store) for n in ast.walk(node)):
+                return False
+    if isinstance(found, tuple):
+        node, original = found
+        if not follow or node.level or not node.module:
+            return False
+        other = node.module.replace(".", "/")
+        for candidate in (other + ".py", other + "/__init__.py"):
+            if os.path.isfile(os.path.join(PINNED, candidate)):
+                return _closure_factory(candidate, original, follow=False)
+        return False
+    if not isinstance(found, ast.FunctionDef) or found.decorator_list:
+        return False
+    body = list(found.body)
+    if body and _is_string_statement(body[0]):
+        body = body[1:]
+    if not body or not isinstance(body[-1], ast.Return):
+        return False
+    made = set()
+    for statement in body[:-1]:
+        if not isinstance(statement, ast.FunctionDef) or statement.decorator_list:
+            return False
+        arguments = statement.args
+        if any(not isinstance(d, ast.Constant) for d in arguments.defaults + [d for d in arguments.kw_defaults if d]):
+            return False
+        made.add(statement.name)
+    value = body[-1].value
+    if isinstance(value, ast.Lambda):
+        arguments = value.args
+        return all(isinstance(d, ast.Constant) for d in arguments.defaults + [d for d in arguments.kw_defaults if d])
+    return isinstance(value, ast.Name) and value.id in made
 
 
 def _is_string_statement(statement):
@@ -1349,7 +1511,7 @@ def select_python(change, maps, notes):
     if diff is None:
         notes.append("%s no longer compiles: every test importing it" % path)
         return bits | maps.importers(path)
-    if diff.whole_module or diff.statements or diff.functions or diff.lambdas or diff.attributes or diff.swaps:
+    if diff.whole_module or diff.statements or diff.functions or diff.lambdas or diff.attributes or diff.swaps or diff.entries:
         # the code changed (not just comments): tests that inspect this package's modules
         bits |= maps.sibling_readers(path)
     if diff.whole_module:
@@ -1427,9 +1589,20 @@ def select_python(change, maps, notes):
             found = (maps.covering(path, lines[0], lines[1]),)
         bits |= found[0]
         other |= found[0]
+    for qualname, name, positions, callees, plain, lines in diff.entries:
+        found = None
+        if all(_closure_factory(path, callee) and not _class_binds(path, qualname, callee) for callee in callees):
+            found = maps.key_readers(path, qualname, name, positions)
+        if found is None:
+            # not covered per key: as a change to the whole attribute if it is one of the
+            # plain kind, else everyone who runs the assignment (imports the module)
+            whole = maps.attribute_readers(path, qualname, name) if plain else None
+            found = whole[0] if whole is not None else maps.covering(path, lines[0], lines[1])
+        bits |= found
+        other |= found
     maps.trace = (path, new_text, ranges, other, bodies)
     notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s), %d operator(s) %s" % (
-        path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes), len(diff.swaps),
+        path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes) + len(diff.entries), len(diff.swaps),
         "; ".join(diff.reasons[:2])))
     return bits
 

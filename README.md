@@ -46,6 +46,7 @@ $RUN /tools/record_attrs.sh    # every test alone: class attributes read
 $RUN /tools/record_cmp.sh      # comparisons and and/or: what each test observed (run it twice, into rec/ and rec2/)
 python3 tools/build_maps.py sqlglot sample/tests.json . rec/iso2 rec/seq/forward.json rec/seq/reverse.json
 python3 tools/build_attr_maps.py sqlglot sample/tests.json . rec/attrs
+python3 tools/build_key_maps.py sqlglot sample/tests.json . rec/attrs rec2/attrs   # record_attrs.sh twice
 python3 tools/build_cmp_maps.py sample/tests.json . rec/cmp rec2/cmp
 $RUN /tools/record_phase.sh    # the slow executor test: which lines run inside its three sqlglot calls
 make build                     # the entry image; the next step runs inside it

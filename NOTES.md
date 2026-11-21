@@ -22,7 +22,8 @@ before the competition we recorded, at the pinned commit, what every test uses:
 - which modules it **imports**,
 - which files it **opens** and which directories it **lists**,
 - which modules it **tries to import and does not find**,
-- which **class attributes** it reads,
+- which **class attributes** it reads, and for dictionaries in class bodies which
+  **entries** it looks up,
 - for every **comparison** it evaluates, how the two operands relate (same object,
   equal, less),
 - for every **`and`/`or` expression** it evaluates, which operands were reached and
@@ -151,6 +152,61 @@ import**: a constant replaced by a constant of the same type inside a literal, o
 creation hook reads the attribute) entries removed from a literal. Anything else, for
 example a changed argument of a call such as `re.compile(...)`, could raise while the
 module is imported and fail every importer, so it falls back to all importers.
+
+### One entry of a class-level table (maps/keys)
+
+Many of those class attributes are dictionaries with hundreds of entries: `FUNCTIONS`,
+`TRANSFORMS`, `SHOW_PARSERS`, `KEYWORDS`. A patch that changes the value of one entry
+(`"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=True)` with `True` turned
+into `False`) changes what the class body builds, so by the rule above every test that
+reads the attribute is a candidate, often every test of the dialect. But only a test
+that looks up *that key* gets the changed value.
+
+So the attribute recording was extended. A dictionary written in a class body is
+replaced, during recording, by a dictionary of the same content that notes which keys a
+test looks up, and when a test does something that shows it every value (`values()`,
+`items()`, a copy, a comparison, printing). Asking whether a key is present, or walking
+the keys, shows no value and is not noted. For each entry written in the class body the
+map holds the tests that looked that key up (or looked at everything), under the
+position of the entry's key in the pinned source.
+
+When this is used (all of it must hold; otherwise the change is treated as before):
+
+- The patch changes only values of entries of one dictionary display in a class body;
+  keys, their order and any `**spread` are untouched.
+- Each changed value is a literal in which constants were replaced by constants of the
+  same type, or a call `f(...)` in which only constant arguments changed and `f` does
+  nothing but define functions and return one (checked on `f`'s pinned source: its body
+  is nested `def`s and a `return` of one of them or of a lambda). Evaluating such a
+  value when the class body runs cannot fail and can do nothing but produce the value.
+- No value of the dictionary was looked at while any class was being created, in any
+  test (a metaclass or `__init_subclass__` hook that computes other attributes from the
+  values would hide the dependency). The same per entry.
+- No other statement of the class body uses the dictionary's name except to walk its
+  keys: inside the class body the plain dictionary is used, where look-ups cannot be
+  seen.
+
+Things that could go wrong, and what was done about them:
+
+- **Reads the recording dictionary does not see.** CPython copies a plain `dict` by
+  reaching into it directly, without calling its methods. For a subclass that overrides
+  `__iter__` and `keys` it goes through `keys()` and `__getitem__` instead. Checked on
+  the image's Python for `dict(d)`, `{**d}`, `f(**d)`, `update`, `|`, `copy`, `json`,
+  `pickle`, `%` and `format_map`: all are seen. A direct `dict.get(d, k)` would not be;
+  sqlglot has none.
+- **The recorder changing what it watches** (the lesson of the comparison recorder).
+  All 1,620 tests pass under it, and the attribute map rebuilt from the new recording
+  is byte for byte the one built before the dictionaries were replaced.
+- **A value copied elsewhere.** A subclass that builds its table from the parent's
+  (`{**Parent.FUNCTIONS, ...}`) looks up every key of the parent's table while it is
+  imported, so every test importing the subclass counts as a reader of every parent
+  entry. That loses precision for the base dialects' tables and keeps the rule sound.
+- **Sets and tuples** are not tracked: Python copies those without calling any method
+  that a subclass could override.
+
+On the sample this turns two commits (a number in `Snowflake.Tokenizer.NUMERIC_ESCAPES`,
+355 tests; a flag in an entry of SingleStore's `SHOW_PARSERS`, 37 tests) into "run
+nothing", which is what the organisers' answers say.
 
 ### Comparison operators (`is` / `==` / `!=` / `<` / `<=` ...)
 
@@ -568,6 +624,8 @@ Listed from most to least worrying.
 
 | + replay extended (whole functions; a different plan with the same rows); cheap candidates run in the image | 112.960 | 0 | 2.8 | see "Through the image" below: all seven sets 0 misses |
 
+| + per-entry map of class-level tables | 96.914 | 0 | 2.6 | "Through the image" below; table-entry checks: 450 patches, 175,207 left-out tests, 0 failures |
+
 The board score of the step before the replay was 193.3 s against 117.4 s on the sample: the
 board's commits happen to select the slow executor test more often. Over every possible
 single-token change (one file drawn at random, then one place in it), the expected cost
@@ -632,19 +690,22 @@ are part of the score). "Rules only" is the selection before replay and candidat
 
 | Set | Commits | Rules only | Now: simulated + helper CPU | Misses |
 | --- | --- | --- | --- | --- |
-| Sample | 30 | 117.4 | 113.0 + 2.8 | 0 |
-| Organiser-like, first | 59 | 450.7 | 344.2 + 36.2 | 0 |
-| Organiser-like, second | 60 | 418.8 | 365.2 + 30.7 | 0 |
-| Mixed kinds | 155 | 1504.8 | 1421.8 + 31.7 | 0 |
-| Class-attribute and lambda rules | 26 | 282.1 | 241.9 + 12.1 | 0 |
-| Hand-made unusual kinds | 42 | 473.5 | 471.0 + 2.0 | 0 |
+| Sample | 30 | 117.4 | 96.9 + 2.6 | 0 |
+| Organiser-like, first | 59 | 450.7 | 344.2 + 36 | 0 |
+| Organiser-like, second | 60 | 418.8 | 365.2 + 31 | 0 |
+| Mixed kinds | 155 | 1504.8 | 1421.8 + 32 | 0 |
+| Class-attribute and lambda rules | 26 | 282.1 | 218.5 + 12 | 0 |
+| Hand-made unusual kinds | 42 | 473.5 | 471.0 + 2 | 0 |
+
+("Rules only" is before the per-entry map as well. The board gave 171.3 s simulated plus
+5 s CPU for the version before the per-entry map, against 113.0 + 2.8 on the sample.)
 
 What is left on the two organiser-like sets is mostly out of reach for a sound rule: a
 few commits change code that runs when a core module is imported (a metaclass, a base
 class). Every test executes it, a handful fail, and the two slowest tests cannot be
 decided for less CPU than they cost to hand out.
 
-### The left-out-tests check (for the comparison and `and`/`or` rules)
+### The left-out-tests check (for the comparison, `and`/`or` and table-entry rules)
 
 The sets above mostly tell us about patches that make tests fail. These rules are about
 tests we *leave out*, so they get a direct check: `tools/gen_swaps.py` draws random
@@ -659,11 +720,17 @@ Every one of them must pass. A single failure means the rule or the recording is
 | Comparison operator swapped, shipped maps, a fresh draw of patches | 400 | 43,713 | 0 |
 | `and` <-> `or` (200 each way) | 400 | 39,876 | 0 |
 | Later operand: the operand replaced by an expression that raises as soon as it is evaluated | 400 | 51,721 | 0 |
+| Table entries, poisoned: an entry's value replaced by something a test cannot use without noticing (a function that raises when called, `None`, another string or number) | 300 | 126,173 | 0 |
+| Table entries, organiser-style: `True`/`False` flipped or a number + 1 inside an entry's value, through the selector | 150 | 49,034 | 0 |
 | Replay of the slow executor test said "same": the real test run on the patched tree | 67 | 67 | 0 |
 | Candidates run in the image, forced on for every commit of the two organiser-like sets, against pytest | 98 | every candidate | 0 passed here but failing there, 0 the other way |
 
 For the later-operand rule the replacement is the harshest possible change: any left-out
-test that evaluates the operand even once crashes.
+test that evaluates the operand even once crashes. The poisoned table entries are the
+same idea: the 300 entries are a random tenth of the 3,216 the map covers, and a
+left-out test that used the entry in any way would fail. The organiser-style row takes
+every single-token change of that kind in sqlglot for which the per-entry map is used
+(151 exist), so it also exercises the selector's own conditions.
 
 The replay row comes from a different draw: 140 random single-token changes (`and`/`or`,
 comparison, `True`/`False`, number + 1, `not` removed) on lines the replay map covers, one

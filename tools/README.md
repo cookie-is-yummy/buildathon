@@ -11,12 +11,12 @@ this repository**, and the selector reads none.
 | `lab.Dockerfile` | The organisers' image plus `requirements.lock` and coverage.py. |
 | `site/sitecustomize.py`, `record_all.sh` | Recorder loaded into every Python process a test starts: executed lines, started functions, imported/opened/listed files. One fresh process tree per test. |
 | `site_seq/`, `record_suite.sh` | The whole suite in one process (normal and reversed order) with one coverage context per test. |
-| `site_attrs/sitecustomize.py`, `record_attrs.sh` | Which tests read which class attribute. |
+| `site_attrs/sitecustomize.py`, `record_attrs.sh` | Which tests read which class attribute, and which entries of class-level dictionaries they look up. |
 | `site_cmp/`, `record_cmp.sh` | What each test observes when it evaluates a comparison (how the operands relate) or an `and`/`or` (which operands were evaluated and true). Every test alone, plus the whole suite in both orders. |
 | `site_replay/`, `record_phase.sh` | For the slow executor test: which lines it executes inside its three sqlglot calls and which outside (all processes). |
 | `record_verify.py` | Run inside the entry image: which tests pass there at the pinned commit (alone and with their file) and their CPU seconds, for `verify.py`. |
 | `record_replay.py` | Run inside the entry image: which lines each TPC-DS query executes when `replay.py` repeats those calls, alone and after other queries, and the CPU each query takes. |
-| `build_maps.py`, `build_attr_maps.py`, `build_cmp_maps.py`, `build_replay_maps.py` | Turn the recordings into `maps/` and copy the pinned sources into `pinned/`. |
+| `build_maps.py`, `build_attr_maps.py`, `build_key_maps.py`, `build_cmp_maps.py`, `build_replay_maps.py` | Turn the recordings into `maps/` and copy the pinned sources into `pinned/`. |
 
 ## Checking the selector
 
@@ -28,6 +28,7 @@ this repository**, and the selector reads none.
 | `gt_loop.sh`, `gt_plugin.py`, `gt_answers.py` | Ground truth: runs the full sqlglot suite on each synthetic patch. |
 | `fast_gt.py`, `fast_eval.py` | Faster ground truth for modules few tests import: only the importers are run. |
 | `gen_swaps.py`, `swap_gt.py` | For the comparison and `and`/`or` rules: makes single-operator patches, and runs exactly the tests the rule leaves out on each patched tree. Every one must pass. |
+| `gen_keys.py` | For the per-entry map of class-level dictionaries: replaces an entry's value by something unusable and lists the tests the map leaves out; `swap_gt.py` runs them. Every one must pass. |
 | `difftest.py` | Checks that parsing only the touched statement gives the same analysis as parsing the whole file. |
 | `check_apply.py` | Checks the selector's patch applier against `git apply`. |
 
