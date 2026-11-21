@@ -239,8 +239,9 @@ Listed from most to least worrying.
 | + whole-suite recordings merged, docstring and default rules | 214.401 | 0 | 0.24 | - |
 | + parse only the touched statement (same answers, less CPU) | 214.401 | 0 | 0.11 | 630/630 identical to whole-file parse |
 | + class-attribute reader maps | 178.749 | 0 | 0.16 (in Docker) | 7 of 155 ground truths so far: 0 misses |
+| + dialect classes instrumented before their metaclass runs | 170.202 | 0 | 0.11 | 20 of 155 ground truths: 0 misses |
 
-By kind on the sample at the last step: code 150.7 s (16 commits; the best possible is
+By kind on the sample at the last step: code 142.1 s (16 commits; the best possible is
 79.1 s), comment 0.0 s (3), fixture 17.9 s (8; best possible 17.9), multi 10.2 s (3; best
 possible 10.2). "Best possible" means selecting exactly the failing tests.
 
