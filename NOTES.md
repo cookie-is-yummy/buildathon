@@ -211,10 +211,6 @@ nothing", which is what the organisers' answers say.
 
 ### Argument tables of expressions (`arg_types`, also in maps/keys)
 
-**Status: recorder and builder are in the repository, the map entries are not yet.**
-They are added once the left-out-tests check for them has run to the end; until then a
-change to such a table is treated as before (every test that reads the attribute).
-
 Every expression class has a table such as
 `arg_types = {"this": True, "expressions": False, "safe": False}`: the arguments it
 takes, and whether each is required. There are about 2,200 `True`/`False` values in
@@ -269,6 +265,13 @@ Guards:
 - Order of tests. The recording runs each test alone. As a cross-check the same
   recorder idea was run over the whole suite in one process: 72,240 pairs of (argument
   seen missing, test), every one of them also seen when the test ran alone.
+
+The map covers 716 tables with 2,179 entries. For 1,078 of them no test can notice a
+flip: a commit that makes such an argument optional, or required when it is always
+given, selects nothing. In my sets the gain is small (5.7 s over 178 organiser-like
+commits) because the expensive tables, those of core classes that most tests validate,
+did not come up; when one does, it is the difference between about 25 s and a handful
+of tests.
 
 What could still be wrong: something reading a class's `__dict__` directly would get
 the set without the descriptor noticing (the attribute map has the same blind spot;
@@ -719,6 +722,8 @@ Listed from most to least worrying.
 
 | + `total=` flag of typed dictionaries | 96.914 | 0 | 2.9 | second organiser-like set 365.2 s -> 328.4 s (one commit in `_typing.py`: 36.8 s -> 0), the others unchanged, 0 misses; whole suite on all 8 possible flips and 2 combinations: 16,200 tests, 0 failures |
 
+| + per-argument readers for the expressions' `arg_types` tables | 96.914 | 0 | 2.5 | first organiser-like set 344.2 s -> 338.6 s, the others and the three synthetic sets unchanged, 0 misses; left-out-tests check on every entry concerned: 1,586 patches, 116,744 tests, 0 failures; the whole suite on 24 of those flips: every failing test selected |
+
 The board score of the step before the replay was 193.3 s against 117.4 s on the sample: the
 board's commits happen to select the slow executor test more often. Over every possible
 single-token change (one file drawn at random, then one place in it), the expected cost
@@ -788,13 +793,18 @@ are part of the score). "Rules only" is the selection before replay and candidat
 
 | Set | Commits | Rules only | Now: simulated + helper CPU | Misses |
 | --- | --- | --- | --- | --- |
-| Sample | 30 | 117.4 | 96.9 + 2.9 | 0 |
-| Organiser-like, first | 59 | 450.7 | 344.2 + 36 | 0 |
+| Sample | 30 | 117.4 | 96.9 + 2.5 | 0 |
+| Organiser-like, first | 59 | 450.7 | 338.6 + 36 | 0 |
 | Organiser-like, second | 60 | 418.8 | 328.4 + 31 | 0 |
 | Organiser-like, third (whole-suite ground truth) | 59 | | 363.4 + 30 | 0 |
 | Mixed kinds | 155 | 1504.8 | 1421.8 + 32 | 0 |
 | Class-attribute and lambda rules | 26 | 282.1 | 218.5 + 12 | 0 |
 | Hand-made unusual kinds | 42 | 473.5 | 471.0 + 2 | 0 |
+
+(The CPU column for the two newest rules was measured as the CPU of the whole container
+run, all processes: sample 3.2 to 3.3 s before them and 2.3 to 2.6 s with them, because
+one sample commit that used to run three candidates now selects nothing outright; the
+second and third organiser-like sets 30 to 31 s before and after.)
 
 ("Rules only" is before the per-entry map as well. The board gave 171.3 s simulated plus
 5 s CPU for the version before the per-entry map, against 113.0 + 2.8 on the sample. With the
@@ -828,6 +838,7 @@ Every one of them must pass. A single failure means the rule or the recording is
 | Table entries, organiser-style: `True`/`False` flipped or a number + 1 inside an entry's value, through the selector | 150 | 49,034 | 0 |
 | Table entries, poisoned, second draw: 400 further entries (351 not in the first draw), same method | 400 | 148,757 | 0 |
 | `total=` flag of a typed dictionary: each of the 8 flips possible in sqlglot, one pair and all 8 at once; the **whole suite** on each | 10 | 16,200 | 0 |
+| Argument tables: the `True`/`False` of an entry flipped, for **every** entry where the per-argument map selects fewer tests than the whole-attribute rule (1,586 of the 2,179 entries); the tests left out are those the older rule would add | 1,586 | 116,744 | 0 |
 | Replay of the slow executor test said "same": the real test run on the patched tree | 67 | 67 | 0 |
 | Candidates run in the image, forced on for every commit of the two organiser-like sets, against pytest | 98 | every candidate | 0 passed here but failing there, 0 the other way |
 
