@@ -624,7 +624,7 @@ Listed from most to least worrying.
 
 | + replay extended (whole functions; a different plan with the same rows); cheap candidates run in the image | 112.960 | 0 | 2.8 | see "Through the image" below: all seven sets 0 misses |
 
-| + per-entry map of class-level tables | 96.914 | 0 | 2.9 | "Through the image" below; table-entry checks: 450 patches, 175,207 left-out tests, 0 failures |
+| + per-entry map of class-level tables | 96.914 | 0 | 2.9 | "Through the image" below; table-entry checks: 850 patches, 323,964 left-out tests, 0 failures |
 
 The board score of the step before the replay was 193.3 s against 117.4 s on the sample: the
 board's commits happen to select the slow executor test more often. Over every possible
@@ -698,7 +698,12 @@ are part of the score). "Rules only" is the selection before replay and candidat
 | Hand-made unusual kinds | 42 | 473.5 | 471.0 + 2 | 0 |
 
 ("Rules only" is before the per-entry map as well. The board gave 171.3 s simulated plus
-5 s CPU for the version before the per-entry map, against 113.0 + 2.8 on the sample.)
+5 s CPU for the version before the per-entry map, against 113.0 + 2.8 on the sample. With the
+per-entry map the board gave 177.5 s in total, 1.3 s worse. The rule can only take tests
+out of a selection, and three local runs of each version use the same CPU (sample 2.8 to
+3.1 s both; 60 organiser-like commits 28 to 30 s both), so the difference is put down to
+CPU time varying between scoring runs. The split of that score is not known, so this is
+not confirmed. The board evidently holds no commit of the table-entry kind.)
 
 What is left on the two organiser-like sets is mostly out of reach for a sound rule: a
 few commits change code that runs when a core module is imported (a metaclass, a base
@@ -722,6 +727,7 @@ Every one of them must pass. A single failure means the rule or the recording is
 | Later operand: the operand replaced by an expression that raises as soon as it is evaluated | 400 | 51,721 | 0 |
 | Table entries, poisoned: an entry's value replaced by something a test cannot use without noticing (a function that raises when called, `None`, another string or number) | 300 | 126,173 | 0 |
 | Table entries, organiser-style: `True`/`False` flipped or a number + 1 inside an entry's value, through the selector | 150 | 49,034 | 0 |
+| Table entries, poisoned, second draw: 400 further entries (351 not in the first draw), same method | 400 | 148,757 | 0 |
 | Replay of the slow executor test said "same": the real test run on the patched tree | 67 | 67 | 0 |
 | Candidates run in the image, forced on for every commit of the two organiser-like sets, against pytest | 98 | every candidate | 0 passed here but failing there, 0 the other way |
 
