@@ -8,6 +8,11 @@ entry (everyone who runs the assignment, minus the entry's readers) are written 
 the patch; tools/swap_gt.py runs exactly those on the patched code. Every one must pass.
 
 usage: gen_keys.py <pinned checkout> <tests.json> <output dir> <how many> [seed]
+
+KEYS_NAME=<attribute> limits the patches to dictionaries assigned to that attribute
+(for example arg_types). KEYS_AGAINST=attribute writes down, instead of everyone who runs
+the assignment, only the tests the rule for whole attributes would select minus the
+entry's readers: far fewer tests per patch, so many more patches can be checked.
 """
 import ast
 import difflib
@@ -66,6 +71,8 @@ for file_name in sorted(os.listdir(directory)):
     table = json.load(open(os.path.join(directory, file_name)))
     for qualname, names in table["tables"].items():
         for name, entries in names.items():
+            if os.environ.get("KEYS_NAME") and name != os.environ["KEYS_NAME"]:
+                continue
             for position in entries:
                 candidates.append((path, qualname, name, position))
 print(len(candidates), "entries in the map")
@@ -102,6 +109,10 @@ for path, qualname, name, position in candidates:
         skipped += 1
         continue
     everyone = maps.covering(path, statement.lineno, statement.end_lineno)
+    if os.environ.get("KEYS_AGAINST") == "attribute":
+        whole = maps.attribute_readers(path, qualname, name)
+        if whole is not None:
+            everyone = whole[0]
     readers = maps.key_readers(path, qualname, name, [(line, column)])
     dropped = maps.numbers(everyone & ~readers)
     if not dropped:

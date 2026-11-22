@@ -1,0 +1,21 @@
+{
+ "classes": {
+  "sqlglot/_typing.py": {
+   "DataTypeArgs": [],
+   "GeneratorArgs": [],
+   "GeneratorNoDialectArgs": [],
+   "GraphHTMLArgs": [],
+   "ParserArgs": [],
+   "ParserNoDialectArgs": [],
+   "SchemaArgs": [],
+   "_DialectArg": []
+  }
+ },
+ "tests": 1620,
+ "watched": [
+  "__total__",
+  "__required_keys__",
+  "__optional_keys__",
+  "__dict__"
+ ]
+}

@@ -181,7 +181,8 @@ When this is used (all of it must hold; otherwise the change is treated as befor
   value when the class body runs cannot fail and can do nothing but produce the value.
 - No value of the dictionary was looked at while any class was being created, in any
   test (a metaclass or `__init_subclass__` hook that computes other attributes from the
-  values would hide the dependency). The same per entry.
+  values would hide the dependency). The same per entry. The one exception, followed
+  through by hand, is the next section.
 - No other statement of the class body uses the dictionary's name except to walk its
   keys: inside the class body the plain dictionary is used, where look-ups cannot be
   seen.
@@ -207,6 +208,96 @@ Things that could go wrong, and what was done about them:
 On the sample this turns two commits (a number in `Snowflake.Tokenizer.NUMERIC_ESCAPES`,
 355 tests; a flag in an entry of SingleStore's `SHOW_PARSERS`, 37 tests) into "run
 nothing", which is what the organisers' answers say.
+
+### Argument tables of expressions (`arg_types`, also in maps/keys)
+
+**Status: recorder and builder are in the repository, the map entries are not yet.**
+They are added once the left-out-tests check for them has run to the end; until then a
+change to such a table is treated as before (every test that reads the attribute).
+
+Every expression class has a table such as
+`arg_types = {"this": True, "expressions": False, "safe": False}`: the arguments it
+takes, and whether each is required. There are about 2,200 `True`/`False` values in
+these tables, and with one change per commit and files drawn evenly, roughly one commit
+in fourteen flips one of them. The per-entry rule above does not cover them, because
+the values are looked at while classes are created. Before this section such a commit
+selected every test that validates an expression of that class: 8 s on average after
+everything else we do.
+
+What sqlglot does with those values is short enough to follow completely:
+
+1. When a class is created, `Expr.__init_subclass__` computes
+   `cls.required_args = {k for k, v in cls.arg_types.items() if v}`. It is the only
+   class-creation hook among the expressions, and the only place the values are read.
+2. `required_args` is read in one place: the loop in `Expression.error_messages`, which
+   adds a message for each required argument that is `None` or an empty list.
+
+So flipping the entry of argument k can matter to a test only if that loop, during the
+test, meets an expression using that table **with argument k missing**. Then a message
+appears (optional became required) or disappears (required became optional). If k is
+always present, the loop does the same thing either way.
+
+The recording (`tools/site_args`, each test alone): `required_args` of every expression
+class is replaced by a descriptor. A read from the loop notes every argument of the
+expression's table that is missing at that moment, required or not. A read from anywhere
+else marks the test as seeing the whole set. `tools/build_arg_maps.py` then writes, for
+each entry, the tests that can notice it:
+
+- tests during which the loop met that argument missing for an expression using the
+  table (a subclass without a table of its own uses its parent's);
+- tests during which the loop found two or more required arguments missing at once for
+  such an expression: the messages come in the order of the set, and a set that gains
+  or loses a member may hand out the others in a different order;
+- tests that read `required_args` outside the loop (none do);
+- tests that looked up the entry's value in the table itself outside class creation
+  (from the per-entry recording).
+
+Guards:
+
+- The builder refuses to write anything unless the pinned `core.py` contains exactly
+  the hook line and the loop quoted above, `required_args` is mentioned nowhere else
+  under `sqlglot/`, and there is no other `__init_subclass__` or metaclass among the
+  expression modules. The other uses of `arg_types` in sqlglot (`k in arg_types`,
+  `len(arg_types)`, walking the keys) do not look at values; if one did, the per-entry
+  recording would show the look-up and the test would be listed.
+- A table whose values are copied into another class's table
+  (`{**Cast.arg_types, ...}`) is left out: the copy is not followed.
+- The entries go into the same map as the other class-level tables, so the selector's
+  conditions are the ones above: only constants replaced by constants of the same
+  type, keys untouched.
+
+- Order of tests. The recording runs each test alone. As a cross-check the same
+  recorder idea was run over the whole suite in one process: 72,240 pairs of (argument
+  seen missing, test), every one of them also seen when the test ran alone.
+
+What could still be wrong: something reading a class's `__dict__` directly would get
+the set without the descriptor noticing (the attribute map has the same blind spot;
+nothing in sqlglot or its tests does that). The check below is the answer to "did I
+overlook a use".
+
+### The `total=` flag of a typed dictionary (maps/typed.json)
+
+`sqlglot/_typing.py` holds eight classes like
+`class ParserArgs(ParserNoDialectArgs, _DialectArg, total=False)`. They exist for type
+checkers. The only single-token changes possible in that file are `total=False` to
+`total=True`, and since files are drawn evenly this small file is as likely to be
+picked as `parser.py`. The class statement runs at import, so the old answer was "every
+test": 36.8 s.
+
+Python's `typing` module uses `total` for exactly three things when it creates such a
+class: the class attributes `__total__`, `__required_keys__` and `__optional_keys__`
+(read off the source of `typing._TypedDictMeta.__new__` in the image's Python; a
+subclass computes its own three from those of its bases). Creating a dictionary with
+the class, or passing it around, never looks at them.
+
+The recording (`tools/site_typed`, each test alone) gives typing's metaclass a
+`__getattribute__` that notes every read of those three attributes or of the whole
+`__dict__` of any typed dictionary, except the reads the metaclass itself makes while
+creating a subclass. The map lists the readers per class. The rule applies when the
+only change to a class header is the `True`/`False` after `total=`, the class stands
+directly in the module body under a name bound once, and the map knows it as a typed
+dictionary. It then selects the readers of **every** typed dictionary (a subclass
+inherits the keys), which at the pinned commit is nobody.
 
 ### Comparison operators (`is` / `==` / `!=` / `<` / `<=` ...)
 
@@ -626,6 +717,8 @@ Listed from most to least worrying.
 
 | + per-entry map of class-level tables | 96.914 | 0 | 2.9 | "Through the image" below; table-entry checks: 850 patches, 323,964 left-out tests, 0 failures |
 
+| + `total=` flag of typed dictionaries | 96.914 | 0 | 2.9 | second organiser-like set 365.2 s -> 328.4 s (one commit in `_typing.py`: 36.8 s -> 0), the others unchanged, 0 misses; whole suite on all 8 possible flips and 2 combinations: 16,200 tests, 0 failures |
+
 The board score of the step before the replay was 193.3 s against 117.4 s on the sample: the
 board's commits happen to select the slow executor test more often. Over every possible
 single-token change (one file drawn at random, then one place in it), the expected cost
@@ -677,6 +770,11 @@ in the proportions of the sample. 60 commits each. Ground truth: pytest on the t
 the rules select (or the whole suite when they select none), one commit left out
 because the patched code never finishes. 44 and 48 of them break at least one test.
 
+A third set of the same kind (60 commits, drawn after everything up to the per-entry
+map was finished) got the strictest ground truth: the **whole suite** on every commit,
+so that every rule is checked together, not each against the one before it. One run
+did not finish; of the other 59 commits 36 break at least one test. No miss.
+
 One correction to the ground-truth tools came out of this: when a test file cannot be
 imported, pytest given test ids stops the whole session, and the tool then counted every
 test as failing. The kit defines "fails" per test (a test whose own file cannot be
@@ -692,7 +790,8 @@ are part of the score). "Rules only" is the selection before replay and candidat
 | --- | --- | --- | --- | --- |
 | Sample | 30 | 117.4 | 96.9 + 2.9 | 0 |
 | Organiser-like, first | 59 | 450.7 | 344.2 + 36 | 0 |
-| Organiser-like, second | 60 | 418.8 | 365.2 + 31 | 0 |
+| Organiser-like, second | 60 | 418.8 | 328.4 + 31 | 0 |
+| Organiser-like, third (whole-suite ground truth) | 59 | | 363.4 + 30 | 0 |
 | Mixed kinds | 155 | 1504.8 | 1421.8 + 32 | 0 |
 | Class-attribute and lambda rules | 26 | 282.1 | 218.5 + 12 | 0 |
 | Hand-made unusual kinds | 42 | 473.5 | 471.0 + 2 | 0 |
@@ -728,6 +827,7 @@ Every one of them must pass. A single failure means the rule or the recording is
 | Table entries, poisoned: an entry's value replaced by something a test cannot use without noticing (a function that raises when called, `None`, another string or number) | 300 | 126,173 | 0 |
 | Table entries, organiser-style: `True`/`False` flipped or a number + 1 inside an entry's value, through the selector | 150 | 49,034 | 0 |
 | Table entries, poisoned, second draw: 400 further entries (351 not in the first draw), same method | 400 | 148,757 | 0 |
+| `total=` flag of a typed dictionary: each of the 8 flips possible in sqlglot, one pair and all 8 at once; the **whole suite** on each | 10 | 16,200 | 0 |
 | Replay of the slow executor test said "same": the real test run on the patched tree | 67 | 67 | 0 |
 | Candidates run in the image, forced on for every commit of the two organiser-like sets, against pytest | 98 | every candidate | 0 passed here but failing there, 0 the other way |
 

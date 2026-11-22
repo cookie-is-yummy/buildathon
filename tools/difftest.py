@@ -6,7 +6,9 @@ index = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.absp
 def key(d):
     if d is None: return None
     return (d.whole_module, sorted(d.statements), sorted(d.functions), sorted(d.lambdas),
-            sorted((a[0], a[1], a[3]) for a in d.attributes), d.docstrings)
+            sorted((a[0], a[1], a[3]) for a in d.attributes), d.docstrings,
+            sorted((e[0], e[1], tuple(e[2]), tuple(e[3]), e[4], e[5]) for e in d.entries), sorted(d.typed),
+            sorted((w[0], w[1], w[2], repr([x[:4] for x in w[3]])) for w in d.swaps))
 n = same = chunked = 0
 for directory in sys.argv[1:]:
     for p in sorted(glob.glob(directory + "/*.patch")):

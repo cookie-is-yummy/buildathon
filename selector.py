@@ -75,6 +75,7 @@ class Maps:
         self._lines = {}
         self._attrs = {}
         self._keys = {}
+        self._typed = None
         self._siblings = {}
         self._comparisons = {}
         self._outcomes = {}
@@ -197,7 +198,14 @@ class Maps:
         """Tests that look up, in the dictionary assigned to class attribute `name` in the
         body of class `qualname`, any of the entries whose keys stand at `positions`
         ((line, column) in the pinned file), or do something that shows every value. None
-        when the map does not cover the dictionary or one of the entries."""
+        when the map does not cover the dictionary or one of the entries.
+
+        For the `arg_types` tables of expressions the map holds something a step further
+        on (tools/build_arg_maps.py): their values are only used to compute
+        `required_args` when a class is created, and that set is only walked by the loop
+        that reports missing arguments. The readers of such an entry are the tests during
+        which that loop met the argument missing, plus anyone who looked at the value or
+        the set in another way."""
         table = self._keys.get(path)
         if table is None:
             file_name = os.path.join(MAPS, "keys", path.replace("/", "__") + ".json")
@@ -212,6 +220,35 @@ class Maps:
             if index is None:
                 return None
             bits |= int(table["sets"][index], 16)
+        return bits
+
+    def typed_readers(self, path, name):
+        """Tests that can notice the `total=` flag of the typed dictionary `name` defined
+        at the top of the pinned module `path`. None when the map does not know the class
+        as a typed dictionary.
+
+        typing's metaclass uses the flag for three attributes of the class and nothing
+        else: `__total__`, `__required_keys__`, `__optional_keys__`. A subclass derives
+        its own three from those of its bases when it is created. The map
+        (maps/typed.json, tools/site_typed) lists, for every typed dictionary, the tests
+        during which something read one of the three or the class's whole `__dict__`. A
+        test in none of those lists runs step for step the same. Because of subclasses
+        the readers of every typed dictionary are returned, not only this one's."""
+        if self.plain:
+            return None
+        if self._typed is None:
+            file_name = os.path.join(MAPS, "typed.json")
+            self._typed = json.load(open(file_name)) if os.path.exists(file_name) else {"classes": {}}
+        classes = self._typed["classes"]
+        if name not in classes.get(path, {}):
+            return None
+        bits = 0
+        for names in classes.values():
+            for tests in names.values():
+                for test in tests:
+                    if test not in self.bit_of:
+                        return None
+                    bits |= 1 << self.bit_of[test]
         return bits
 
     def _attributes(self, path):
@@ -606,6 +643,9 @@ class Diff:
         #  names of functions called to make the new values, also fine as a whole-attribute
         #  change?, (first, last) lines of the assignment)
         self.entries = []
+        # module-level classes of which only the True/False given as `total=` in the header
+        # changed: (class name, (first, last) lines of the header)
+        self.typed = []
         self.docstrings = 0  # class or module docstrings whose text changed
         self.changed_top = []  # new-side module/class level statements that may differ
         self.reasons = []
@@ -672,6 +712,26 @@ def _def_header(node):
                      [_dump(d) for d in node.decorator_list], [_dump(p) for p in getattr(node, "type_params", [])]))
     return repr((type(node).__name__, node.name, _dump(node.args), [_dump(d) for d in node.decorator_list],
                  node.returns and _dump(node.returns), [_dump(p) for p in getattr(node, "type_params", [])]))
+
+
+def _only_total_differs(a, b):
+    """True when two class headers differ only in the True/False passed as `total=`."""
+    if (a.name != b.name or [_dump(x) for x in a.bases] != [_dump(x) for x in b.bases]
+            or a.decorator_list or b.decorator_list
+            or getattr(a, "type_params", []) or getattr(b, "type_params", [])
+            or len(a.keywords) != len(b.keywords)):
+        return False
+    changed = 0
+    for x, y in zip(a.keywords, b.keywords):
+        if x.arg != y.arg:
+            return False
+        if _dump(x.value) == _dump(y.value):
+            continue
+        if (x.arg != "total" or not isinstance(x.value, ast.Constant) or not isinstance(y.value, ast.Constant)
+                or type(x.value.value) is not bool or type(y.value.value) is not bool):
+            return False
+        changed += 1
+    return changed == 1
 
 
 def _only_constant_defaults_differ(a, b):
@@ -820,6 +880,11 @@ def _diff_statement(a, b, function, diff, old_blocks, new_blocks, pairs, owner=N
                 # A default value is only looked at when the function is called.
                 diff.functions.append(_function_body_range(a))
                 diff.reasons.append("default argument of %s changed" % a.name)
+            elif function is None and owner is None and isinstance(a, ast.ClassDef) and _only_total_differs(a, b):
+                # For a typed dictionary the flag decides three attributes of the class and
+                # nothing else (see Maps.typed_readers, which also checks that it is one).
+                diff.typed.append((a.name, (_def_first_line(a), _header_last_line(a))))
+                diff.reasons.append("`total` flag in the header of %s" % a.name)
             elif function is None:
                 # The def or class statement runs when its module (or class body) does:
                 # whoever executes the header line depends on it.
@@ -1160,6 +1225,27 @@ def _class_binds(path, qualname, name):
             elif isinstance(statement, (ast.Import, ast.ImportFrom)):
                 return True
     return False
+
+
+def _top_level_class(path, name):
+    """True when the pinned module at `path` binds `name` exactly once at module level,
+    with a plain `class` statement standing directly in the module body."""
+    tree = _module_tree(path)
+    if tree is None:
+        return False
+    found = 0
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == name and not node.decorator_list:
+            found += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((alias.asname or alias.name).split(".")[0] == name or alias.name == "*" for alias in node.names):
+                return False
+        elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == name:
+                return False
+        elif any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del)) for n in ast.walk(node)):
+            return False
+    return found == 1
 
 
 def _closure_factory(path, name, follow=True):
@@ -1511,7 +1597,8 @@ def select_python(change, maps, notes):
     if diff is None:
         notes.append("%s no longer compiles: every test importing it" % path)
         return bits | maps.importers(path)
-    if diff.whole_module or diff.statements or diff.functions or diff.lambdas or diff.attributes or diff.swaps or diff.entries:
+    if (diff.whole_module or diff.statements or diff.functions or diff.lambdas or diff.attributes or diff.swaps
+            or diff.entries or diff.typed):
         # the code changed (not just comments): tests that inspect this package's modules
         bits |= maps.sibling_readers(path)
     if diff.whole_module:
@@ -1589,6 +1676,13 @@ def select_python(change, maps, notes):
             found = (maps.covering(path, lines[0], lines[1]),)
         bits |= found[0]
         other |= found[0]
+    for name, lines in diff.typed:
+        found = maps.typed_readers(path, name) if _top_level_class(path, name) else None
+        if found is None:
+            # not known to be a typed dictionary: everyone who runs the class statement
+            found = maps.covering(path, lines[0], lines[1])
+        bits |= found
+        other |= found
     for qualname, name, positions, callees, plain, lines in diff.entries:
         found = None
         if all(_closure_factory(path, callee) and not _class_binds(path, qualname, callee) for callee in callees):
@@ -1602,7 +1696,8 @@ def select_python(change, maps, notes):
         other |= found
     maps.trace = (path, new_text, ranges, other, bodies)
     notes.append("%s: %d statement(s), %d function(s), %d lambda(s), %d attribute(s), %d operator(s) %s" % (
-        path, len(diff.statements), len(diff.functions), len(diff.lambdas), len(diff.attributes) + len(diff.entries), len(diff.swaps),
+        path, len(diff.statements), len(diff.functions), len(diff.lambdas),
+        len(diff.attributes) + len(diff.entries) + len(diff.typed), len(diff.swaps),
         "; ".join(diff.reasons[:2])))
     return bits
 
